@@ -15,23 +15,29 @@
 
 """Slime reward adapter bridge server.
 
-This server bridges Slime's remote_rm protocol to NeMo-Gym's verify endpoint.
-Slime sends POST requests with {prompt, response, label} and expects a JSON
-reward response. This adapter translates those into NeMo-Gym's BaseVerifyRequest
-format, calls the underlying resources server's /verify endpoint, and returns
-the reward in Slime's expected format.
+This server bridges Slime's remote_rm protocol to NeMo-Gym's verify/run endpoints.
 
-It also exposes a standard NeMo-Gym resources server interface so it can
-function as a normal NeMo-Gym resources server too.
+Supports ALL NeMo-Gym environments through two modes:
+
+1. **Verify mode** (simple environments): Slime generates text with SGLang, then this
+   adapter calls the NeMo-Gym resources server's /verify endpoint with the response
+   and verifier_metadata. Works for: math, mcqa, code_gen, instruction_following, etc.
+
+2. **Agent /run mode** (tool-calling environments): This adapter calls the NeMo-Gym
+   agent's /run endpoint which handles the full generate -> tool call -> verify loop.
+   Works for: tavily_search, google_search, ns_tools, workplace_assistant, openenv, etc.
+
+Slime sends: {prompt, response, label, metadata}
+- metadata can contain verifier_metadata for NeMo-Gym environments
+- For agent /run mode, metadata should contain the full responses_create_params
 """
 
-import json
 import logging
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import aiohttp
-from fastapi import Body, FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 
 from nemo_gym.base_resources_server import (
@@ -40,7 +46,6 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
-from nemo_gym.config_types import ResourcesServerRef
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -56,51 +61,63 @@ class SlimeRewardRequest(BaseModel):
     """Request format from Slime's remote_rm.
 
     Slime sends {prompt, response, label} to the reward endpoint.
+    metadata can contain verifier_metadata for NeMo-Gym environments.
     """
 
     prompt: Any  # str or list[dict] (conversation format)
     response: str
     label: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class SlimeRewardResponse(BaseModel):
-    """Response format expected by Slime's remote_rm.
-
-    Returns scalar reward and optional metadata.
-    """
+    """Response format expected by Slime's remote_rm."""
 
     reward: float
     metadata: Optional[Dict[str, Any]] = None
 
 
+class SlimeAgentRunRequest(BaseModel):
+    """Request for the /slime_agent_run endpoint.
+
+    Used for tool-calling environments where Slime delegates the full
+    generate -> tool call -> verify loop to NeMo-Gym's agent.
+    """
+
+    responses_create_params: Dict[str, Any]
+    verifier_metadata: Optional[Dict[str, Any]] = None
+
+
 class SlimeRewardAdapterConfig(BaseResourcesServerConfig):
     """Configuration for the Slime reward adapter.
 
-    The adapter can either:
-    1. Proxy to an upstream NeMo-Gym resources server (upstream_server_url)
-    2. Use a built-in reward function (reward_type)
+    Modes:
+    1. Built-in: reward_type = "exact_match" or "contains" (standalone, no upstream)
+    2. Proxy to resources server: upstream_server_url points to a NeMo-Gym resources server /verify
+    3. Agent run: upstream_agent_url points to a NeMo-Gym agent /run endpoint
     """
 
-    # URL of the upstream NeMo-Gym resources server to proxy verify requests to
+    # URL of upstream NeMo-Gym resources server for verify-mode proxy
     upstream_server_url: Optional[str] = None
 
-    # Built-in reward type for standalone operation (e.g., "exact_match", "contains")
+    # URL of upstream NeMo-Gym agent for agent-run mode (tool-calling environments)
+    upstream_agent_url: Optional[str] = None
+
+    # Built-in reward type for standalone operation
     reward_type: str = "proxy"
 
-    # Default system prompt to inject when converting Slime prompts to NeMo-Gym format
+    # Default system prompt to inject when converting Slime prompts
     default_system_prompt: Optional[str] = None
 
 
 class SlimeRewardAdapter(SimpleResourcesServer):
-    """Bridge between Slime's remote_rm and NeMo-Gym's verify endpoint.
+    """Bridge between Slime and ALL NeMo-Gym environments.
 
-    Provides two interfaces:
-    1. POST /slime_reward - Slime's native {prompt, response, label} format
-    2. POST /verify - Standard NeMo-Gym verify endpoint
-
-    When upstream_server_url is configured, /verify requests are proxied
-    to the upstream resources server. Otherwise, a simple built-in reward
-    function is used.
+    Endpoints:
+    1. POST /slime_reward - Slime's native {prompt, response, label, metadata} format
+    2. POST / - Same as /slime_reward (Slime posts to rm_url root)
+    3. POST /slime_agent_run - For tool-calling envs, delegates to NeMo-Gym agent /run
+    4. POST /verify - Standard NeMo-Gym verify endpoint
     """
 
     config: SlimeRewardAdapterConfig
@@ -108,11 +125,9 @@ class SlimeRewardAdapter(SimpleResourcesServer):
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
 
-        # Add Slime-compatible reward endpoint
         app.post("/slime_reward")(self.slime_reward)
-
-        # Also mount at root for Slime's rm_url (Slime POSTs to the URL directly)
         app.post("/")(self.slime_reward)
+        app.post("/slime_agent_run")(self.slime_agent_run)
 
         return app
 
@@ -138,19 +153,12 @@ class SlimeRewardAdapter(SimpleResourcesServer):
                 }
             )
         elif isinstance(prompt, list):
-            # Conversation format: list of {role, content} dicts
             for msg in prompt:
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     content = [{"type": "input_text", "text": content}]
-                messages.append(
-                    {
-                        "role": role,
-                        "type": "message",
-                        "content": content,
-                    }
-                )
+                messages.append({"role": role, "type": "message", "content": content})
         else:
             messages.append(
                 {
@@ -174,11 +182,7 @@ class SlimeRewardAdapter(SimpleResourcesServer):
                     id=f"msg_{uuid4().hex}",
                     role="assistant",
                     content=[
-                        NeMoGymResponseOutputText(
-                            type="output_text",
-                            text=response_text,
-                            annotations=[],
-                        )
+                        NeMoGymResponseOutputText(type="output_text", text=response_text, annotations=[])
                     ],
                     status="completed",
                     type="message",
@@ -190,43 +194,92 @@ class SlimeRewardAdapter(SimpleResourcesServer):
         )
 
     async def slime_reward(self, body: SlimeRewardRequest) -> SlimeRewardResponse:
-        """Handle Slime's remote_rm format and return reward."""
-        # Convert Slime format to NeMo-Gym format
+        """Handle Slime's remote_rm format and return reward.
+
+        Supports all NeMo-Gym environments by passing verifier_metadata
+        from Slime's sample.metadata through to the verify endpoint.
+        """
         input_messages = self._convert_prompt_to_input(body.prompt)
+
+        # Build metadata dict: merge label + Slime metadata
+        metadata_for_params = {}
+        if body.label is not None:
+            metadata_for_params["label"] = body.label
+
         responses_create_params = NeMoGymResponseCreateParamsNonStreaming(
             input=input_messages,
             model="slime",
+            metadata=metadata_for_params if metadata_for_params else None,
         )
         response = self._convert_response_to_nemogym(body.response)
 
+        # Build the verify request dict with verifier_metadata as extra field
+        verify_dict = {
+            "responses_create_params": responses_create_params.model_dump(),
+            "response": response.model_dump(),
+        }
+
+        # Pass through verifier_metadata from Slime's sample metadata
+        # This is how NeMo-Gym environments receive task-specific data
+        # (unit_tests, expected_answer, options, etc.)
+        if body.metadata and "verifier_metadata" in body.metadata:
+            verify_dict["verifier_metadata"] = body.metadata["verifier_metadata"]
+        elif body.metadata:
+            # If metadata doesn't have explicit verifier_metadata key,
+            # use the entire metadata dict as verifier_metadata
+            verify_dict["verifier_metadata"] = body.metadata
+            if body.label is not None:
+                verify_dict["verifier_metadata"]["label"] = body.label
+                verify_dict["verifier_metadata"]["expected_answer"] = body.label
+
+        if self.config.upstream_server_url:
+            return await self._proxy_verify(verify_dict)
+
+        # Use built-in verify
         verify_request = BaseVerifyRequest(
             responses_create_params=responses_create_params,
             response=response,
         )
-
-        # Add label to verifier_metadata if present
-        if body.label is not None:
-            # Store label in the responses_create_params metadata for the verify endpoint
-            if verify_request.responses_create_params.metadata is None:
-                verify_request.responses_create_params.metadata = {}
-            verify_request.responses_create_params.metadata["label"] = body.label
-
-        if self.config.upstream_server_url:
-            return await self._proxy_verify(verify_request, body.label)
-
-        # Use built-in verify
         verify_response = await self.verify(verify_request)
         return SlimeRewardResponse(reward=verify_response.reward)
 
-    async def _proxy_verify(self, verify_request: BaseVerifyRequest, label: Optional[str] = None) -> SlimeRewardResponse:
-        """Proxy the verify request to the upstream NeMo-Gym resources server."""
-        verify_dict = verify_request.model_dump()
-
+    async def _proxy_verify(self, verify_dict: Dict[str, Any]) -> SlimeRewardResponse:
+        """Proxy the verify request to an upstream NeMo-Gym resources server."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.config.upstream_server_url}/verify",
                 json=verify_dict,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                resp.raise_for_status()
+                result = await resp.json()
+
+        reward = result.get("reward", 0.0)
+        return SlimeRewardResponse(reward=reward, metadata=result)
+
+    async def slime_agent_run(self, body: SlimeAgentRunRequest) -> SlimeRewardResponse:
+        """Delegate to NeMo-Gym agent's /run endpoint for tool-calling environments.
+
+        This is used for environments that require multi-step tool interaction
+        (tavily_search, google_search, ns_tools, workplace_assistant, openenv, etc.).
+        The NeMo-Gym agent handles the full generate -> tool call -> verify loop.
+        """
+        if not self.config.upstream_agent_url:
+            return SlimeRewardResponse(
+                reward=0.0,
+                metadata={"error": "upstream_agent_url not configured for agent run mode"},
+            )
+
+        # Build the /run request body
+        run_body = {"responses_create_params": body.responses_create_params}
+        if body.verifier_metadata:
+            run_body["verifier_metadata"] = body.verifier_metadata
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.config.upstream_agent_url}/run",
+                json=run_body,
+                timeout=aiohttp.ClientTimeout(total=300),
             ) as resp:
                 resp.raise_for_status()
                 result = await resp.json()
@@ -263,7 +316,6 @@ class SlimeRewardAdapter(SimpleResourcesServer):
         elif self.config.reward_type == "contains" and label is not None:
             reward = 1.0 if label.strip() in response_text else 0.0
         elif self.config.reward_type == "proxy":
-            # When no upstream URL, default to 0.0
             reward = 0.0
         else:
             reward = 0.0

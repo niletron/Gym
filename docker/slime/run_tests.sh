@@ -61,6 +61,13 @@ if [ $TEST_EXIT -eq 0 ]; then
     TEST_EXIT=$?
 fi
 
+if [ $TEST_EXIT -eq 0 ]; then
+    echo ""
+    echo "Running all-environment compatibility tests..."
+    python /workspace/nemo-gym/docker/slime/test_all_envs.py
+    TEST_EXIT=$?
+fi
+
 # Cleanup
 echo ""
 echo "Cleaning up..."
