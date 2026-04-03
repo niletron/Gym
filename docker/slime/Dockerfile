@@ -29,6 +29,9 @@ RUN pip install "wandb>=0.25"
 RUN pip install --force-reinstall --no-deps blinker && \
     pip install mlflow-skinny mlflow || true
 
+# Install Slime's dependencies that may be needed for testing
+RUN pip install pylatexenc 2>&1 | tail -3
+
 # Verify critical imports work
 RUN PYTHONPATH=/workspace/nemo-gym python -c "import wandb; import nemo_gym; print('nemo_gym imports OK')"
 

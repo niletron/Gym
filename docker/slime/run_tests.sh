@@ -68,6 +68,20 @@ if [ $TEST_EXIT -eq 0 ]; then
     TEST_EXIT=$?
 fi
 
+if [ $TEST_EXIT -eq 0 ]; then
+    echo ""
+    echo "Running real NeMo-Gym server tests (proxy mode, tool endpoints)..."
+    python /workspace/nemo-gym/docker/slime/test_real_servers.py
+    TEST_EXIT=$?
+fi
+
+if [ $TEST_EXIT -eq 0 ] && [ -d "/workspace/slime" ]; then
+    echo ""
+    echo "Running Slime source code integration test..."
+    python /workspace/nemo-gym/docker/slime/test_slime_source.py
+    TEST_EXIT=$?
+fi
+
 # Cleanup
 echo ""
 echo "Cleaning up..."

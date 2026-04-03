@@ -247,15 +247,19 @@ class SlimeRewardAdapter(SimpleResourcesServer):
         if body.verifier_metadata:
             run_body["verifier_metadata"] = body.verifier_metadata
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{self.config.upstream_agent_url}/run",
-                json=run_body,
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
-        return SlimeRewardResponse(reward=result.get("reward", 0.0), metadata=result)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.config.upstream_agent_url}/run",
+                    json=run_body,
+                    timeout=aiohttp.ClientTimeout(total=300),
+                ) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+            return SlimeRewardResponse(reward=result.get("reward", 0.0), metadata=result)
+        except Exception as exc:
+            logger.warning("Agent /run call failed: %s", exc)
+            return SlimeRewardResponse(reward=0.0, metadata={"error": str(exc)})
 
     async def verify(self, body: BaseVerifyRequest) -> BaseVerifyResponse:
         """Built-in verify: ``exact_match`` or ``contains`` against the label."""
