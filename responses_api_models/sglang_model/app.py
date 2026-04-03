@@ -15,23 +15,29 @@
 
 """SGLang model server for NeMo-Gym.
 
-SGLang exposes OpenAI-compatible /v1/chat/completions endpoints, so this server
-builds on the existing VLLMModel with SGLang-specific configuration and health
-checking via the SGLang /get_model_info and /health_generate endpoints.
+SGLang exposes an OpenAI-compatible ``/v1/chat/completions`` endpoint, so this
+server inherits from :class:`VLLMModel` and adds SGLang-specific configuration
+(router health checks, native sampling params).
+
+Typical config (YAML)::
+
+    policy_model:
+      responses_api_models:
+        sglang_model:
+          entrypoint: app.py
+          base_url: http://localhost:30000/v1
+          api_key: EMPTY
+          model: Qwen/Qwen2.5-0.5B-Instruct
+          return_token_id_information: false
+          uses_reasoning_parser: true
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional
 
+import aiohttp
 from fastapi import FastAPI, Request
 
-from nemo_gym.base_responses_api_model import Body
-from nemo_gym.openai_utils import (
-    NeMoGymChatCompletion,
-    NeMoGymChatCompletionCreateParamsNonStreaming,
-    NeMoGymResponse,
-    NeMoGymResponseCreateParamsNonStreaming,
-)
 from nemo_gym.server_utils import is_nemo_gym_fastapi_worker
 from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
 
@@ -39,96 +45,59 @@ logger = logging.getLogger(__name__)
 
 
 class SGLangModelConfig(VLLMModelConfig):
-    """Configuration for SGLang model server.
+    """Extends :class:`VLLMModelConfig` with SGLang-specific fields.
 
-    Inherits from VLLMModelConfig since SGLang exposes OpenAI-compatible endpoints.
-    Adds SGLang-specific configuration for features like the /generate endpoint
-    with native logprob support and router health monitoring.
+    Attributes:
+        sglang_router_url: Base URL of the SGLang router (without ``/v1``).
+            Used for health-checking via ``/health_generate``.
+        use_native_generate: Reserved for future use — whether to call SGLang's
+            ``/generate`` endpoint instead of the OpenAI-compat layer.
+        sglang_sampling_params: Extra key/value pairs merged into every chat
+            completion request (e.g. ``min_new_tokens``).
     """
 
-    # SGLang router URL for direct /generate calls (bypasses OpenAI compat layer).
-    # If set, used for health checks and can be used for low-level generation.
     sglang_router_url: Optional[str] = None
-
-    # Whether to use SGLang's native /generate endpoint for logprobs
-    # instead of the OpenAI-compatible /v1/chat/completions endpoint.
-    # The native endpoint returns more detailed logprob information.
     use_native_generate: bool = False
-
-    # SGLang sampling parameters not available in the OpenAI compat API
     sglang_sampling_params: Optional[Dict[str, Any]] = None
 
 
 class SGLangModel(VLLMModel):
-    """SGLang model server that extends VLLMModel.
+    """SGLang model server.
 
-    SGLang's OpenAI-compatible API is fully compatible with the VLLMModel
-    implementation. This subclass adds:
-    - SGLang-specific configuration
-    - Health checking via SGLang's /health_generate endpoint
-    - Support for SGLang's native /generate endpoint (optional)
+    Since SGLang's OpenAI-compat API is wire-compatible with vLLM, this class
+    only adds:
+
+    * ``GET /sglang_health`` — probes the SGLang router's health endpoint.
+    * SGLang-specific sampling params merged into every request.
     """
 
     config: SGLangModelConfig
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
-
-        # Add SGLang-specific health check endpoint
         app.get("/sglang_health")(self.sglang_health)
-
         return app
 
     async def sglang_health(self) -> Dict[str, Any]:
-        """Check SGLang engine health via the router or direct engine endpoint."""
-        health_info = {"status": "ok", "backend": "sglang"}
-
+        """Probe the SGLang router and return a health summary."""
+        info: Dict[str, Any] = {"status": "ok", "backend": "sglang"}
         if self.config.sglang_router_url:
             try:
-                import aiohttp
-
                 async with aiohttp.ClientSession() as session:
                     async with session.get(
                         f"{self.config.sglang_router_url}/health_generate",
                         timeout=aiohttp.ClientTimeout(total=5),
                     ) as resp:
-                        if resp.status == 200:
-                            health_info["router_status"] = "healthy"
-                        else:
-                            health_info["router_status"] = f"unhealthy (status {resp.status})"
-            except Exception as e:
-                health_info["router_status"] = f"unreachable ({e})"
-
-        return health_info
-
-    async def responses(
-        self, request: Request, body: NeMoGymResponseCreateParamsNonStreaming = Body()
-    ) -> NeMoGymResponse:
-        """Handle responses endpoint. Delegates to VLLMModel implementation.
-
-        SGLang's /v1/chat/completions is fully compatible with vLLM's.
-        """
-        return await super().responses(request, body)
-
-    async def chat_completions(
-        self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming = Body()
-    ) -> NeMoGymChatCompletion:
-        """Handle chat completions endpoint. Delegates to VLLMModel implementation.
-
-        SGLang's /v1/chat/completions is fully compatible with vLLM's.
-        """
-        return await super().chat_completions(request, body)
+                        info["router_status"] = "healthy" if resp.status == 200 else f"unhealthy ({resp.status})"
+            except Exception as exc:
+                info["router_status"] = f"unreachable ({exc})"
+        return info
 
     def _preprocess_chat_completion_create_params(self, request: Request, body_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply SGLang-specific preprocessing on top of VLLMModel's preprocessing."""
         body_dict = super()._preprocess_chat_completion_create_params(request, body_dict)
-
-        # Merge SGLang-specific sampling params if configured
         if self.config.sglang_sampling_params:
             for key, value in self.config.sglang_sampling_params.items():
-                if key not in body_dict:
-                    body_dict[key] = value
-
+                body_dict.setdefault(key, value)
         return body_dict
 
 

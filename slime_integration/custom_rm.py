@@ -1,51 +1,51 @@
-"""Custom Slime reward models that call NeMo-Gym environments.
+"""Custom Slime reward-model functions that call NeMo-Gym environments.
 
-Supports ALL NeMo-Gym environments through two modes:
+Two modes
+---------
+``nemogym_rm``
+    *Verify-only* environments (math, mcqa, code_gen, …).
+    Slime generates with SGLang → this RM sends the response text to the
+    reward adapter's ``/slime_reward`` endpoint → reward returned.
 
-1. **nemogym_rm** (simple environments): Slime generates with SGLang, then this
-   RM calls the reward adapter's /slime_reward endpoint with the response text
-   and verifier_metadata. Works for: math, mcqa, code_gen, instruction_following, etc.
+``nemogym_agent_rm``
+    *Tool-calling* environments (tavily_search, google_search, ns_tools, …).
+    This RM posts to ``/slime_agent_run`` which delegates to the NeMo-Gym
+    agent's ``/run`` endpoint for the full generate → tool → verify loop.
 
-2. **nemogym_agent_rm** (tool-calling environments): This RM calls the reward
-   adapter's /slime_agent_run endpoint which delegates to NeMo-Gym's agent /run.
-   The agent handles generate -> tool call -> verify. Works for: tavily_search,
-   google_search, ns_tools, workplace_assistant, openenv, etc.
+Usage with Slime::
 
-Usage with Slime:
-    # Simple environments (Slime generates, NeMo-Gym verifies):
-    python train.py ... --custom-rm-path slime_integration.custom_rm.nemogym_rm \\
+    # Verify-only environments
+    python train.py ... \\
+        --custom-rm-path slime_integration.custom_rm.nemogym_rm \\
         --rm-url http://localhost:8100
 
-    # Tool-calling environments (NeMo-Gym agent generates + verifies):
-    python train.py ... --custom-rm-path slime_integration.custom_rm.nemogym_agent_rm \\
+    # Tool-calling environments
+    python train.py ... \\
+        --custom-rm-path slime_integration.custom_rm.nemogym_agent_rm \\
         --rm-url http://localhost:8100
 """
 
+import asyncio
+
 import aiohttp
+
+# ---------------------------------------------------------------------------
+# Verify-only environments
+# ---------------------------------------------------------------------------
 
 
 async def nemogym_rm(args, sample, **kwargs):
-    """Custom Slime RM for simple verify-only NeMo-Gym environments.
+    """Score a Slime ``Sample`` against a NeMo-Gym environment (verify mode).
 
-    Sends {prompt, response, label, metadata} to the reward adapter.
-    The metadata field should contain verifier_metadata for the target
-    NeMo-Gym environment (e.g., unit_tests, expected_answer, options, etc.).
-
-    Args:
-        args: Slime argument namespace (must have args.rm_url)
-        sample: Slime Sample object with .prompt, .response, .label, .metadata
-        **kwargs: Additional keyword arguments (ignored)
-
-    Returns:
-        float: Reward value from NeMo-Gym
+    The adapter receives ``{prompt, response, label, metadata}`` and returns a
+    scalar reward.  ``sample.metadata`` can carry ``verifier_metadata`` for
+    rich NeMo-Gym environments (unit tests, options, schemas, …).
     """
     payload = {
         "prompt": sample.prompt,
         "response": sample.response,
         "label": sample.label,
     }
-
-    # Pass through metadata (contains verifier_metadata for NeMo-Gym environments)
     if hasattr(sample, "metadata") and sample.metadata:
         payload["metadata"] = sample.metadata
 
@@ -58,79 +58,38 @@ async def nemogym_rm(args, sample, **kwargs):
             resp.raise_for_status()
             result = await resp.json()
 
-    reward = result.get("reward", 0.0)
-    if isinstance(reward, dict) and hasattr(args, "reward_key") and args.reward_key:
-        reward = reward[args.reward_key]
-    return reward
+    return _extract_reward(result, args)
+
+
+async def nemogym_batched_rm(args, samples, **kwargs):
+    """Concurrent version of :func:`nemogym_rm`."""
+    return await asyncio.gather(*(nemogym_rm(args, s, **kwargs) for s in samples))
+
+
+# ---------------------------------------------------------------------------
+# Tool-calling environments
+# ---------------------------------------------------------------------------
 
 
 async def nemogym_agent_rm(args, sample, **kwargs):
-    """Custom Slime RM for tool-calling NeMo-Gym environments.
+    """Score via a NeMo-Gym *agent* ``/run`` (tool-calling environments).
 
-    Instead of just verifying the response text, this RM delegates to
-    the NeMo-Gym agent's /run endpoint which handles the full
-    generate -> tool call -> verify loop.
+    The adapter delegates the full generate → tool-call → verify loop to
+    NeMo-Gym, so Slime's own SGLang generation is not used for this sample.
 
-    The Slime sample's metadata must contain:
-    - responses_create_params: The NeMo-Gym prompt format
-    - verifier_metadata: Task-specific verification data
-
-    For this mode, Slime's SGLang generation is SKIPPED - the NeMo-Gym
-    agent handles generation internally. Use a custom generate function
-    that returns the agent's response (see nemogym_generate below).
-
-    Args:
-        args: Slime argument namespace (must have args.rm_url)
-        sample: Slime Sample object
-        **kwargs: Additional keyword arguments (ignored)
-
-    Returns:
-        float: Reward value from NeMo-Gym
+    ``sample.metadata`` should contain either:
+    * ``responses_create_params`` (NeMo-Gym native prompt), or
+    * a plain prompt (auto-converted).
     """
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rcp = metadata.get("responses_create_params") or _prompt_to_rcp(sample.prompt)
+    vm = metadata.get("verifier_metadata", {})
 
-    # Build the agent run request
-    # If metadata has explicit responses_create_params, use it
-    if "responses_create_params" in metadata:
-        rcp = metadata["responses_create_params"]
-    else:
-        # Convert Slime's prompt to NeMo-Gym format
-        prompt = sample.prompt
-        if isinstance(prompt, str):
-            input_messages = [
-                {
-                    "role": "user",
-                    "type": "message",
-                    "content": [{"type": "input_text", "text": prompt}],
-                }
-            ]
-        elif isinstance(prompt, list):
-            input_messages = []
-            for msg in prompt:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    content = [{"type": "input_text", "text": content}]
-                input_messages.append({"role": role, "type": "message", "content": content})
-        else:
-            input_messages = [
-                {
-                    "role": "user",
-                    "type": "message",
-                    "content": [{"type": "input_text", "text": str(prompt)}],
-                }
-            ]
-        rcp = {"input": input_messages, "model": "slime"}
-
-    verifier_metadata = metadata.get("verifier_metadata", {})
     if sample.label is not None:
-        verifier_metadata["label"] = sample.label
-        verifier_metadata["expected_answer"] = sample.label
+        vm.setdefault("label", sample.label)
+        vm.setdefault("expected_answer", sample.label)
 
-    payload = {
-        "responses_create_params": rcp,
-        "verifier_metadata": verifier_metadata,
-    }
+    payload = {"responses_create_params": rcp, "verifier_metadata": vm}
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
@@ -141,23 +100,38 @@ async def nemogym_agent_rm(args, sample, **kwargs):
             resp.raise_for_status()
             result = await resp.json()
 
+    return _extract_reward(result, args)
+
+
+async def nemogym_agent_batched_rm(args, samples, **kwargs):
+    """Concurrent version of :func:`nemogym_agent_rm`."""
+    return await asyncio.gather(*(nemogym_agent_rm(args, s, **kwargs) for s in samples))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_reward(result: dict, args) -> float:
     reward = result.get("reward", 0.0)
-    if isinstance(reward, dict) and hasattr(args, "reward_key") and args.reward_key:
+    if isinstance(reward, dict) and getattr(args, "reward_key", None):
         reward = reward[args.reward_key]
     return reward
 
 
-async def nemogym_batched_rm(args, samples, **kwargs):
-    """Batched version of nemogym_rm. Processes all samples concurrently."""
-    import asyncio
-
-    tasks = [nemogym_rm(args, sample, **kwargs) for sample in samples]
-    return await asyncio.gather(*tasks)
-
-
-async def nemogym_agent_batched_rm(args, samples, **kwargs):
-    """Batched version of nemogym_agent_rm. Processes all samples concurrently."""
-    import asyncio
-
-    tasks = [nemogym_agent_rm(args, sample, **kwargs) for sample in samples]
-    return await asyncio.gather(*tasks)
+def _prompt_to_rcp(prompt) -> dict:
+    """Convert a Slime prompt (str or chat list) to ``responses_create_params``."""
+    if isinstance(prompt, str):
+        messages = [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": prompt}]}]
+    elif isinstance(prompt, list):
+        messages = []
+        for m in prompt:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                content = [{"type": "input_text", "text": content}]
+            messages.append({"role": role, "type": "message", "content": content})
+    else:
+        messages = [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": str(prompt)}]}]
+    return {"input": messages, "model": "slime"}

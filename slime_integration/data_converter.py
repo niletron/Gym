@@ -1,144 +1,88 @@
-"""Data format converters between Slime and NeMo-Gym JSONL formats.
+"""Bidirectional JSONL conversion between Slime and NeMo-Gym data formats.
 
-Slime JSONL format:
-    {"input": "...", "label": "...", "metadata": {...}}
+Slime JSONL (one line)::
 
-NeMo-Gym JSONL format:
+    {"input": "What is 2+2?", "label": "4", "metadata": {"rm_type": "math"}}
+
+NeMo-Gym JSONL (one line)::
+
     {"responses_create_params": {"input": [...]}, "verifier_metadata": {...}}
+
+CLI usage::
+
+    python -m slime_integration.data_converter input.jsonl output.jsonl \\
+        --direction slime_to_nemogym
+
+Programmatic usage::
+
+    from slime_integration.data_converter import slime_to_nemogym, nemogym_to_slime
+    row = slime_to_nemogym({"input": "2+2?", "label": "4"})
 """
 
 import json
-import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+# ---------------------------------------------------------------------------
+# Slime → NeMo-Gym
+# ---------------------------------------------------------------------------
+
+
 def slime_to_nemogym(
-    slime_row: Dict[str, Any],
+    row: Dict[str, Any],
     input_key: str = "input",
     label_key: str = "label",
     metadata_key: str = "metadata",
     system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Convert a single Slime JSONL row to NeMo-Gym format.
+    """Convert one Slime JSONL row into NeMo-Gym format."""
+    prompt = row.get(input_key, "")
+    label = row.get(label_key)
+    metadata = row.get(metadata_key, {}) or {}
 
-    Args:
-        slime_row: Dict from Slime JSONL (has input_key, label_key, metadata_key fields)
-        input_key: Key for the prompt field in Slime data
-        label_key: Key for the ground truth label
-        metadata_key: Key for metadata
-        system_prompt: Optional system prompt to prepend
+    input_msgs = _prompt_to_messages(prompt, system_prompt)
 
-    Returns:
-        Dict in NeMo-Gym JSONL format
-    """
-    prompt = slime_row.get(input_key, "")
-    label = slime_row.get(label_key)
-    metadata = slime_row.get(metadata_key, {}) or {}
-
-    # Build NeMo-Gym input messages
-    input_messages = []
-    if system_prompt:
-        input_messages.append(
-            {
-                "role": "system",
-                "type": "message",
-                "content": [{"type": "input_text", "text": system_prompt}],
-            }
-        )
-
-    if isinstance(prompt, str):
-        input_messages.append(
-            {
-                "role": "user",
-                "type": "message",
-                "content": [{"type": "input_text", "text": prompt}],
-            }
-        )
-    elif isinstance(prompt, list):
-        # Already in conversation format
-        for msg in prompt:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                content = [{"type": "input_text", "text": content}]
-            input_messages.append(
-                {
-                    "role": role,
-                    "type": "message",
-                    "content": content,
-                }
-            )
-
-    # Build verifier metadata
     verifier_metadata = dict(metadata)
     if label is not None:
         verifier_metadata["label"] = label
         verifier_metadata["expected_answer"] = label
 
     return {
-        "responses_create_params": {
-            "input": input_messages,
-            "model": "slime",
-        },
+        "responses_create_params": {"input": input_msgs, "model": "slime"},
         "verifier_metadata": verifier_metadata,
     }
 
 
+# ---------------------------------------------------------------------------
+# NeMo-Gym → Slime
+# ---------------------------------------------------------------------------
+
+
 def nemogym_to_slime(
-    nemogym_row: Dict[str, Any],
+    row: Dict[str, Any],
     input_key: str = "input",
     label_key: str = "label",
     metadata_key: str = "metadata",
 ) -> Dict[str, Any]:
-    """Convert a single NeMo-Gym JSONL row to Slime format.
+    """Convert one NeMo-Gym JSONL row into Slime format."""
+    rcp = row.get("responses_create_params", {})
+    vm = row.get("verifier_metadata", {})
 
-    Args:
-        nemogym_row: Dict from NeMo-Gym JSONL
-        input_key: Key for the prompt field in Slime data
-        label_key: Key for the ground truth label
-        metadata_key: Key for metadata
+    prompt = _messages_to_prompt(rcp.get("input", []))
+    label = vm.get("label") or vm.get("expected_answer")
+    metadata = {k: v for k, v in vm.items() if k not in ("label", "expected_answer")}
 
-    Returns:
-        Dict in Slime JSONL format
-    """
-    rcp = nemogym_row.get("responses_create_params", {})
-    verifier_metadata = nemogym_row.get("verifier_metadata", {})
-
-    # Extract prompt from NeMo-Gym input messages
-    input_messages = rcp.get("input", [])
-    if isinstance(input_messages, str):
-        prompt = input_messages
-    elif isinstance(input_messages, list):
-        # Convert to conversation format
-        prompt = []
-        for msg in input_messages:
-            role = msg.get("role", "user")
-            content_parts = msg.get("content", [])
-            if isinstance(content_parts, list):
-                text = " ".join(p.get("text", "") for p in content_parts if p.get("type") in ("input_text", "text"))
-            elif isinstance(content_parts, str):
-                text = content_parts
-            else:
-                text = str(content_parts)
-            prompt.append({"role": role, "content": text})
-
-        # If single user message, simplify to string
-        if len(prompt) == 1 and prompt[0]["role"] == "user":
-            prompt = prompt[0]["content"]
-    else:
-        prompt = str(input_messages)
-
-    label = verifier_metadata.get("label") or verifier_metadata.get("expected_answer")
-    metadata = {k: v for k, v in verifier_metadata.items() if k not in ("label", "expected_answer")}
-
-    result = {input_key: prompt}
+    result: Dict[str, Any] = {input_key: prompt}
     if label is not None:
         result[label_key] = label
     if metadata:
         result[metadata_key] = metadata
-
     return result
+
+
+# ---------------------------------------------------------------------------
+# File conversion
+# ---------------------------------------------------------------------------
 
 
 def convert_file(
@@ -150,76 +94,96 @@ def convert_file(
     metadata_key: str = "metadata",
     system_prompt: Optional[str] = None,
 ) -> int:
-    """Convert an entire JSONL file between formats.
-
-    Args:
-        input_path: Path to input JSONL file
-        output_path: Path to output JSONL file
-        direction: "slime_to_nemogym" or "nemogym_to_slime"
-        input_key: Slime's prompt field key
-        label_key: Slime's label field key
-        metadata_key: Slime's metadata field key
-        system_prompt: Optional system prompt (only for slime_to_nemogym)
-
-    Returns:
-        Number of rows converted
-    """
-    converter = slime_to_nemogym if direction == "slime_to_nemogym" else nemogym_to_slime
+    """Convert an entire JSONL file. Returns number of rows processed."""
+    fn = slime_to_nemogym if direction == "slime_to_nemogym" else nemogym_to_slime
     count = 0
-
     with open(input_path) as fin, open(output_path, "w") as fout:
         for line in fin:
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
-
+            kwargs: Dict[str, Any] = dict(input_key=input_key, label_key=label_key, metadata_key=metadata_key)
             if direction == "slime_to_nemogym":
-                converted = converter(
-                    row,
-                    input_key=input_key,
-                    label_key=label_key,
-                    metadata_key=metadata_key,
-                    system_prompt=system_prompt,
-                )
-            else:
-                converted = converter(
-                    row,
-                    input_key=input_key,
-                    label_key=label_key,
-                    metadata_key=metadata_key,
-                )
-
-            fout.write(json.dumps(converted, ensure_ascii=False) + "\n")
+                kwargs["system_prompt"] = system_prompt
+            fout.write(json.dumps(fn(row, **kwargs), ensure_ascii=False) + "\n")
             count += 1
-
     return count
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _prompt_to_messages(prompt: Any, system_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
+    msgs: List[Dict[str, Any]] = []
+    if system_prompt:
+        msgs.append(_msg("system", system_prompt))
+    if isinstance(prompt, str):
+        msgs.append(_msg("user", prompt))
+    elif isinstance(prompt, list):
+        for m in prompt:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if isinstance(content, str):
+                content = [{"type": "input_text", "text": content}]
+            msgs.append({"role": role, "type": "message", "content": content})
+    else:
+        msgs.append(_msg("user", str(prompt)))
+    return msgs
+
+
+def _msg(role: str, text: str) -> Dict[str, Any]:
+    return {"role": role, "type": "message", "content": [{"type": "input_text", "text": text}]}
+
+
+def _messages_to_prompt(input_messages):
+    """Convert NeMo-Gym input messages back to a Slime prompt."""
+    if isinstance(input_messages, str):
+        return input_messages
+    if not isinstance(input_messages, list):
+        return str(input_messages)
+
+    prompt = []
+    for msg in input_messages:
+        role = msg.get("role", "user")
+        parts = msg.get("content", [])
+        if isinstance(parts, list):
+            text = " ".join(p.get("text", "") for p in parts if p.get("type") in ("input_text", "text"))
+        elif isinstance(parts, str):
+            text = parts
+        else:
+            text = str(parts)
+        prompt.append({"role": role, "content": text})
+
+    # Simplify single user message to a plain string
+    if len(prompt) == 1 and prompt[0]["role"] == "user":
+        return prompt[0]["content"]
+    return prompt
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert between Slime and NeMo-Gym JSONL formats")
-    parser.add_argument("input_path", help="Path to input JSONL file")
-    parser.add_argument("output_path", help="Path to output JSONL file")
-    parser.add_argument(
-        "--direction",
-        choices=["slime_to_nemogym", "nemogym_to_slime"],
-        default="slime_to_nemogym",
-    )
-    parser.add_argument("--input-key", default="input")
-    parser.add_argument("--label-key", default="label")
-    parser.add_argument("--metadata-key", default="metadata")
-    parser.add_argument("--system-prompt", default=None)
+    p = argparse.ArgumentParser(description="Convert between Slime and NeMo-Gym JSONL formats")
+    p.add_argument("input_path")
+    p.add_argument("output_path")
+    p.add_argument("--direction", choices=["slime_to_nemogym", "nemogym_to_slime"], default="slime_to_nemogym")
+    p.add_argument("--input-key", default="input")
+    p.add_argument("--label-key", default="label")
+    p.add_argument("--metadata-key", default="metadata")
+    p.add_argument("--system-prompt", default=None)
+    args = p.parse_args()
 
-    args = parser.parse_args()
-    count = convert_file(
-        args.input_path,
-        args.output_path,
+    n = convert_file(
+        args.input_path, args.output_path,
         direction=args.direction,
-        input_key=args.input_key,
-        label_key=args.label_key,
-        metadata_key=args.metadata_key,
+        input_key=args.input_key, label_key=args.label_key, metadata_key=args.metadata_key,
         system_prompt=args.system_prompt,
     )
-    print(f"Converted {count} rows ({args.direction}): {args.input_path} -> {args.output_path}")
+    print(f"Converted {n} rows ({args.direction}): {args.input_path} -> {args.output_path}")

@@ -18,52 +18,35 @@ from nemo_gym.server_utils import ServerClient
 from responses_api_models.sglang_model.app import SGLangModel, SGLangModelConfig
 
 
+def _make_config(**overrides):
+    defaults = dict(
+        host="0.0.0.0", port=8080, entrypoint="", name="",
+        base_url="http://localhost:30000/v1", api_key="EMPTY",
+        model="test-model", return_token_id_information=False,
+        uses_reasoning_parser=True,
+    )
+    return SGLangModelConfig(**(defaults | overrides))
+
+
 class TestSGLangModel:
-    def test_sanity(self) -> None:
-        config = SGLangModelConfig(
-            host="0.0.0.0",
-            port=8080,
-            entrypoint="",
-            name="",
-            base_url="http://localhost:30000/v1",
-            api_key="EMPTY",
-            model="test-model",
-            return_token_id_information=False,
-            uses_reasoning_parser=True,
-        )
-        model = SGLangModel(config=config, server_client=MagicMock(spec=ServerClient))
+    def test_sanity(self):
+        model = SGLangModel(config=_make_config(), server_client=MagicMock(spec=ServerClient))
         assert model.config.base_url == ["http://localhost:30000/v1"]
 
-    def test_sglang_specific_config(self) -> None:
-        config = SGLangModelConfig(
-            host="0.0.0.0",
-            port=8080,
-            entrypoint="",
-            name="",
-            base_url="http://localhost:30000/v1",
-            api_key="EMPTY",
-            model="test-model",
-            return_token_id_information=False,
-            uses_reasoning_parser=False,
-            sglang_router_url="http://localhost:30000",
-            use_native_generate=False,
-            sglang_sampling_params={"min_new_tokens": 1},
+    def test_sglang_config_fields(self):
+        model = SGLangModel(
+            config=_make_config(
+                sglang_router_url="http://localhost:30000",
+                sglang_sampling_params={"min_new_tokens": 1},
+            ),
+            server_client=MagicMock(spec=ServerClient),
         )
-        model = SGLangModel(config=config, server_client=MagicMock(spec=ServerClient))
         assert model.config.sglang_router_url == "http://localhost:30000"
         assert model.config.sglang_sampling_params == {"min_new_tokens": 1}
 
-    def test_multiple_base_urls(self) -> None:
-        config = SGLangModelConfig(
-            host="0.0.0.0",
-            port=8080,
-            entrypoint="",
-            name="",
-            base_url=["http://localhost:30000/v1", "http://localhost:30001/v1"],
-            api_key="EMPTY",
-            model="test-model",
-            return_token_id_information=False,
-            uses_reasoning_parser=True,
+    def test_multiple_endpoints(self):
+        model = SGLangModel(
+            config=_make_config(base_url=["http://a:30000/v1", "http://b:30000/v1"]),
+            server_client=MagicMock(spec=ServerClient),
         )
-        model = SGLangModel(config=config, server_client=MagicMock(spec=ServerClient))
         assert len(model.config.base_url) == 2
