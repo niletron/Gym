@@ -1,0 +1,39 @@
+# Example config: SGLang model server + Slime reward adapter
+# Usage: ng_run "+config_paths=[slime_integration/configs/sglang_with_reward_adapter.yaml]"
+
+# SGLang model server (connects to SGLang inference endpoint)
+policy_model:
+  responses_api_models:
+    sglang_model:
+      entrypoint: app.py
+      base_url: ${policy_base_url}
+      api_key: ${policy_api_key}
+      model: ${policy_model_name}
+      return_token_id_information: false
+      uses_reasoning_parser: true
+
+# Slime reward adapter (bridges Slime remote_rm to NeMo-Gym verify)
+slime_reward_adapter:
+  resources_servers:
+    slime_reward_adapter:
+      entrypoint: app.py
+      domain: slime
+      verified: false
+      description: Bridge between Slime remote_rm and NeMo-Gym verify endpoints
+      reward_type: exact_match
+
+# Agent (optional - for NeMo-Gym's own rollout collection)
+slime_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: slime_reward_adapter
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/slime_reward_adapter/data/example.jsonl

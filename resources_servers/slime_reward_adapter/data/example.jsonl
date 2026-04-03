@@ -1,0 +1,5 @@
+{"responses_create_params": {"input": [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": "What is 2+2?"}]}], "model": "slime"}, "verifier_metadata": {"label": "4", "expected_answer": "4"}}
+{"responses_create_params": {"input": [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": "What is the capital of France?"}]}], "model": "slime"}, "verifier_metadata": {"label": "Paris", "expected_answer": "Paris"}}
+{"responses_create_params": {"input": [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": "What is 10 * 5?"}]}], "model": "slime"}, "verifier_metadata": {"label": "50", "expected_answer": "50"}}
+{"responses_create_params": {"input": [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": "What color is the sky?"}]}], "model": "slime"}, "verifier_metadata": {"label": "blue", "expected_answer": "blue"}}
+{"responses_create_params": {"input": [{"role": "user", "type": "message", "content": [{"type": "input_text", "text": "What is 7+3?"}]}], "model": "slime"}, "verifier_metadata": {"label": "10", "expected_answer": "10"}}

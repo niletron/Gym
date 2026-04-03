@@ -1,0 +1,8 @@
+slime_reward_adapter:
+  resources_servers:
+    slime_reward_adapter:
+      entrypoint: app.py
+      domain: slime
+      verified: false
+      description: Bridge between Slime remote_rm and NeMo-Gym verify endpoints
+      reward_type: proxy

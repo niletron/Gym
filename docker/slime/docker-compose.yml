@@ -1,0 +1,196 @@
+version: "3.8"
+
+services:
+  # SGLang model server - serves a small model for testing
+  sglang-server:
+    image: lmsysorg/sglang:v0.4.6.post1-cu124
+    command: >
+      python -m sglang.launch_server
+      --model-path Qwen/Qwen2.5-0.5B-Instruct
+      --host 0.0.0.0
+      --port 30000
+      --dp 1
+      --tp 1
+      --mem-fraction-static 0.8
+    ports:
+      - "30000:30000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "16g"
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:30000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 120s
+    networks:
+      - slime-net
+
+  # NeMo-Gym reward adapter server
+  nemogym-reward:
+    build:
+      context: ../..
+      dockerfile: docker/slime/Dockerfile
+    command: >
+      python -c "
+      import uvicorn
+      from resources_servers.slime_reward_adapter.app import SlimeRewardAdapter, SlimeRewardAdapterConfig
+      from unittest.mock import MagicMock
+      from nemo_gym.server_utils import ServerClient
+
+      config = SlimeRewardAdapterConfig(
+          host='0.0.0.0',
+          port=8100,
+          entrypoint='app.py',
+          name='slime_reward_adapter',
+          reward_type='exact_match',
+      )
+      adapter = SlimeRewardAdapter(config=config, server_client=MagicMock(spec=ServerClient))
+      app = adapter.setup_webserver()
+      uvicorn.run(app, host='0.0.0.0', port=8100)
+      "
+    ports:
+      - "8100:8100"
+    networks:
+      - slime-net
+
+  # Integration test runner
+  test-runner:
+    build:
+      context: ../..
+      dockerfile: docker/slime/Dockerfile
+    command: >
+      python -c "
+      import asyncio
+      import aiohttp
+      import json
+      import sys
+      import time
+
+      async def wait_for_service(url, name, timeout=300):
+          start = time.time()
+          while time.time() - start < timeout:
+              try:
+                  async with aiohttp.ClientSession() as session:
+                      async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                          if resp.status == 200:
+                              print(f'{name} is ready!')
+                              return True
+              except Exception:
+                  pass
+              await asyncio.sleep(5)
+              print(f'Waiting for {name}...')
+          print(f'{name} not ready after {timeout}s')
+          return False
+
+      async def test_sglang():
+          print('=== Testing SGLang Model Server ===')
+          payload = {
+              'model': 'Qwen/Qwen2.5-0.5B-Instruct',
+              'messages': [{'role': 'user', 'content': 'What is 2+2? Answer with just the number.'}],
+              'max_tokens': 16,
+              'temperature': 0.0,
+          }
+          async with aiohttp.ClientSession() as session:
+              async with session.post(
+                  'http://sglang-server:30000/v1/chat/completions',
+                  json=payload,
+              ) as resp:
+                  result = await resp.json()
+                  print(f'SGLang response: {json.dumps(result, indent=2)}')
+                  assert 'choices' in result
+                  print('SGLang test PASSED')
+
+      async def test_reward_adapter():
+          print('=== Testing NeMo-Gym Reward Adapter ===')
+          payload = {'prompt': 'What is 2+2?', 'response': '4', 'label': '4'}
+          async with aiohttp.ClientSession() as session:
+              async with session.post(
+                  'http://nemogym-reward:8100/slime_reward',
+                  json=payload,
+              ) as resp:
+                  result = await resp.json()
+                  print(f'Reward response: {json.dumps(result, indent=2)}')
+                  assert result['reward'] == 1.0
+                  print('Reward adapter test PASSED (correct answer)')
+
+          payload = {'prompt': 'What is 2+2?', 'response': '5', 'label': '4'}
+          async with aiohttp.ClientSession() as session:
+              async with session.post(
+                  'http://nemogym-reward:8100/slime_reward',
+                  json=payload,
+              ) as resp:
+                  result = await resp.json()
+                  assert result['reward'] == 0.0
+                  print('Reward adapter test PASSED (wrong answer)')
+
+      async def test_end_to_end():
+          print('=== Testing End-to-End: SGLang + Reward ===')
+          # Step 1: Generate response from SGLang
+          gen_payload = {
+              'model': 'Qwen/Qwen2.5-0.5B-Instruct',
+              'messages': [{'role': 'user', 'content': 'What is 2+2? Answer with just the number.'}],
+              'max_tokens': 16,
+              'temperature': 0.0,
+          }
+          async with aiohttp.ClientSession() as session:
+              async with session.post(
+                  'http://sglang-server:30000/v1/chat/completions',
+                  json=gen_payload,
+              ) as resp:
+                  gen_result = await resp.json()
+                  response_text = gen_result['choices'][0]['message']['content']
+                  print(f'Model response: {response_text}')
+
+          # Step 2: Get reward from adapter
+          reward_payload = {
+              'prompt': 'What is 2+2? Answer with just the number.',
+              'response': response_text,
+              'label': '4',
+          }
+          async with aiohttp.ClientSession() as session:
+              async with session.post(
+                  'http://nemogym-reward:8100/slime_reward',
+                  json=reward_payload,
+              ) as resp:
+                  reward_result = await resp.json()
+                  print(f'Reward: {reward_result[\"reward\"]}')
+                  print('End-to-end test PASSED')
+
+      async def main():
+          # Wait for services
+          sglang_ready = await wait_for_service('http://sglang-server:30000/health', 'SGLang')
+          reward_ready = await wait_for_service('http://nemogym-reward:8100/docs', 'Reward Adapter')
+
+          if not sglang_ready or not reward_ready:
+              print('FAILED: Services not ready')
+              sys.exit(1)
+
+          await test_sglang()
+          await test_reward_adapter()
+          await test_end_to_end()
+          print()
+          print('=== ALL TESTS PASSED ===')
+
+      asyncio.run(main())
+      "
+    depends_on:
+      sglang-server:
+        condition: service_healthy
+      nemogym-reward:
+        condition: service_started
+    networks:
+      - slime-net
+
+networks:
+  slime-net:
+    driver: bridge
