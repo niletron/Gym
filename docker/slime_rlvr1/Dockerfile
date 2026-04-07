@@ -1,3 +1,4 @@
+ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
 # Copy NeMo-Gym into the container
@@ -18,9 +19,10 @@ RUN pip install \
     "rich" \
     2>&1 | tail -5
 
-# instruction_following needs verifiable_instructions
-RUN pip install "verifiable_instructions @ git+https://github.com/google-research/google-research.git#subdirectory=instruction_following_eval" 2>&1 | tail -3 || \
-    echo "WARNING: verifiable_instructions install failed - instruction_following server will not work"
+# instruction_following needs verifiable_instructions + spacy model
+RUN pip install "git+https://github.com/abukharin-nv/verifiable-instructions.git" \
+    "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" \
+    2>&1 | tail -5 || echo "WARNING: verifiable_instructions install failed"
 
 # Add server-local deps to PYTHONPATH (several servers use local imports)
 ENV PYTHONPATH="/workspace/nemo-gym:\

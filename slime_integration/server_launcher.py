@@ -32,7 +32,9 @@ SERVER_REGISTRY: Dict[str, Dict[str, Any]] = {
         "class": "SingleStepToolUseArgumentComparisonResourcesServer",
         "config_class": "SingleStepToolUseArgumentComparisonResourcesServerConfig",
         "port": 10001,
-        "extra_config": {},
+        "extra_config": {
+            "tool_call_comparator_config": {"word_count_similarity_threshold": 0.1},
+        },
     },
     "instruction_following": {
         "module": "resources_servers.instruction_following.app",

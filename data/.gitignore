@@ -1,3 +1,6 @@
 *.json
 *.jsonl
 *.csv
+*.jsonl
+rlvr1/
+rlvr1_filled/
