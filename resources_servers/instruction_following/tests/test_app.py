@@ -202,3 +202,34 @@ class TestApp:
             grading_mode="fraction",
         )
         self._run_verify_test(real_request, False, 0.5, [True, False])
+
+    def test_leading_newlines_paragraph_first_word(self):
+        """Leading \\n\\n should be stripped so paragraph N first-word check uses correct index.
+
+        Bug: nth_paragraph_first_word splits on \\n\\n. With leading \\n\\n,
+        paragraphs[0] is empty, so paragraphs[1] (actually paragraph 1 content)
+        is checked when asking for paragraph 2. Stripping fixes the off-by-one.
+        """
+        # paragraph 2 starts with "Moreover" -- but without strip, the off-by-one
+        # makes paragraphs[1] point to paragraph 1 content, failing the check.
+        content = "\n\nThe first paragraph begins here with some text.\n\nMoreover the second paragraph starts with this word.\n\nFinally the third paragraph."
+        real_request = self._create_real_request(
+            instruction_ids=["length_constraints:nth_paragraph_first_word"],
+            prompt="Start the second paragraph with the word Moreover.",
+            kwargs=[{"first_word": "moreover", "nth_paragraph": 2, "num_paragraphs": 3}],
+            response_content=content,
+            request_id=401,
+        )
+        self._run_verify_test(real_request, True, 1.0, [True])
+
+    def test_no_leading_whitespace_still_works(self):
+        """Verify stripping doesn't break responses that already have no leading whitespace."""
+        content = "The first paragraph begins here with some text.\n\nMoreover the second paragraph starts with this word.\n\nFinally the third paragraph."
+        real_request = self._create_real_request(
+            instruction_ids=["length_constraints:nth_paragraph_first_word"],
+            prompt="Start the second paragraph with the word Moreover.",
+            kwargs=[{"first_word": "moreover", "nth_paragraph": 2, "num_paragraphs": 3}],
+            response_content=content,
+            request_id=402,
+        )
+        self._run_verify_test(real_request, True, 1.0, [True])

@@ -98,6 +98,10 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
                 # Extract text from the nested content structure
                 final_response_text = last_output.content[0].text
 
+        # Strip leading/trailing whitespace to prevent paragraph off-by-one errors
+        # (e.g. leading \n\n from <think> tag removal creates an empty first paragraph)
+        final_response_text = final_response_text.strip()
+
         # Verify each instruction using the verifiable instructions
         instruction_list = body.instruction_id_list
         kwargs_list = body.kwargs

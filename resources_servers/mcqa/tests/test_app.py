@@ -74,9 +74,10 @@ class TestApp:
             grading_mode="strict_single_letter_boxed",
         )
 
-        # strict requires boxed; plain C should fail
+        # strict_single_letter_boxed alone would reject plain C, but fallback
+        # "The answer is X" pattern now catches it (intentional fix for training)
         result = await server.verify(verify_request)
-        assert result.reward == 0.0
+        assert result.reward == 1.0
 
         # Now send boxed C (strict)
         response_boxed = NeMoGymResponse(
@@ -494,6 +495,76 @@ def _make_verify_request(text: str, expected: str = "B", grading_mode: str = "st
     )
 
 
+class TestFallbackExtraction:
+    """Test fallback extraction patterns: {X} and 'The answer is: X'."""
+
+    def _make_server(self):
+        return MCQAResourcesServer(
+            config=MCQAResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name=""),
+            server_client=MagicMock(spec=ServerClient),
+        )
+
+    async def test_curly_brace_format(self) -> None:
+        """Test {G} curly brace answer format."""
+        server = self._make_server()
+        body = _make_verify_request(
+            text="After careful analysis, my answer is {B}.",
+            expected="B",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_the_answer_is_colon(self) -> None:
+        """Test 'The answer is: C' format."""
+        server = self._make_server()
+        body = _make_verify_request(
+            text="Based on the evidence, the answer is: C",
+            expected="C",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "C"
+        assert result.reward == 1.0
+
+    async def test_the_answer_is_no_colon(self) -> None:
+        """Test 'The answer is C' format (no colon)."""
+        server = self._make_server()
+        body = _make_verify_request(
+            text="Therefore, the answer is D",
+            expected="D",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "D"
+        assert result.reward == 1.0
+
+    async def test_boxed_still_takes_priority(self) -> None:
+        """Test that \\boxed{} still works and takes priority over fallbacks."""
+        server = self._make_server()
+        body = _make_verify_request(
+            text="The answer is A but actually \\boxed{B}",
+            expected="B",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
+
+    async def test_wrong_fallback_answer(self) -> None:
+        """Test that wrong answer via fallback still gets reward=0."""
+        server = self._make_server()
+        body = _make_verify_request(
+            text="The answer is: A",
+            expected="B",
+            grading_mode="strict_single_letter_boxed",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "A"
+        assert result.reward == 0.0
+
+
 class TestGradingModeConfig:
     """Test that MCQAResourcesServerConfig.grading_mode overrides per-row grading_mode."""
 
@@ -525,14 +596,16 @@ class TestGradingModeConfig:
         )
         server = MCQAResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
+        # strict_single_letter_boxed alone doesn't match, but the "the answer is"
+        # fallback now catches it (intentional fix for RLVR training signal recovery)
         body = _make_verify_request(
             text="I think the answer is B.\n\nAnswer: B",
             expected="B",
             grading_mode="strict_single_letter_boxed",
         )
         result = await server.verify(body)
-        assert result.extracted_answer is None
-        assert result.reward == 0.0
+        assert result.extracted_answer == "B"
+        assert result.reward == 1.0
 
 
 class TestGradingModeAnswerColonMD:

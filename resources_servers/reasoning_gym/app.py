@@ -95,6 +95,12 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
 
         full_text = "".join(assistant_responses)
 
+        # Strip <think>...</think> tags (thinking models emit these before content)
+        full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL).strip()
+        # Strip markdown code fences (e.g. ```json ... ```)
+        full_text = re.sub(r"^```\w*\n?", "", full_text)
+        full_text = re.sub(r"\n?```$", "", full_text)
+
         # Try <answer> tags first (reasoning gym default)
         extracted = extract_answer(full_text, tag_name="answer")
         if extracted is not None:
@@ -104,9 +110,24 @@ class ReasoningGymResourcesServer(SimpleResourcesServer):
         # this could be a slight instruction following issue, if model is prompted to use <answer> but uses boxed instead
         # found for deepseek-distill-qwen-1.5b it fails to use <answer> tags in favor of boxed, hence this fallback
         # may advise commenting this out for large models who follow instructions to use <answer> well
-        boxed_match = re.search(r"\\boxed\{([^}]+)\}", full_text)
+        boxed_match = re.search(r"\\boxed\{(.+)\}", full_text, flags=re.DOTALL)
         if boxed_match:
-            return boxed_match.group(1).strip()
+            content = boxed_match.group(1).strip()
+            # Balance braces: if there are unmatched closing braces, trim to the balanced prefix
+            depth = 0
+            end_idx = len(content)
+            for i, ch in enumerate(content):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    if depth == 0:
+                        end_idx = i
+                        break
+                    depth -= 1
+            content = content[:end_idx].strip()
+            # Normalize LaTeX fractions: \frac{a}{b} -> a/b
+            content = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"\1/\2", content)
+            return content
 
         # return full text if <answer> or \boxed{} fail
         return full_text.strip() if full_text.strip() else ""

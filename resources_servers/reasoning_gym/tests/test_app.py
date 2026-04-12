@@ -113,6 +113,84 @@ class TestApp:
         assert verify_response.reward <= 0.1, f"Expected low reward for incorrect answer, got {verify_response.reward}"
 
     @pytest.mark.asyncio
+    async def test_reasoning_gym_boxed_frac_normalization(self, server):
+        """Test that \\boxed{\\frac{9213}{12160}} matches label 9213/12160."""
+        # Use basic_arithmetic as a simple task that compares answers
+        dataset = reasoning_gym.create_dataset("fraction_simplification", size=1, seed=42)
+        entry = dataset[0]
+
+        # Simulate model answering with LaTeX fraction in boxed
+        response = self._create_response(
+            text=f"\\boxed{{\\frac{{{entry['answer'].replace('/', '}{')}}}}}",
+            msg_id="test_frac_boxed",
+        )
+
+        verify_request = ReasoningGymVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
+                input=[{"role": "user", "content": entry["question"]}]
+            ),
+            response=response,
+            question=entry["question"],
+            answer=entry["answer"],
+            metadata=entry["metadata"],
+        )
+
+        verify_response = await server.verify(verify_request)
+        # The extracted answer should have \frac{a}{b} normalized to a/b
+        assert verify_response.extracted_answer is not None
+        assert "/" in verify_response.extracted_answer or verify_response.reward >= 0.9
+
+    @pytest.mark.asyncio
+    async def test_reasoning_gym_think_tags_stripped(self, server):
+        """Test that <think>...</think> tags are stripped before answer extraction."""
+        dataset = reasoning_gym.create_dataset("knights_knaves", size=1, seed=42)
+        entry = dataset[0]
+
+        # Simulate model answering with think tags wrapping the answer
+        response = self._create_response(
+            text=f"<think>Let me reason through this...</think>\n{entry['answer']}",
+            msg_id="test_think_strip",
+        )
+
+        verify_request = ReasoningGymVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
+                input=[{"role": "user", "content": entry["question"]}]
+            ),
+            response=response,
+            question=entry["question"],
+            answer=entry["answer"],
+            metadata=entry["metadata"],
+        )
+
+        verify_response = await server.verify(verify_request)
+        assert verify_response.reward >= 0.9, f"Should score high after stripping <think> tags, got {verify_response.reward}"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_gym_code_fence_stripped(self, server):
+        """Test that markdown code fences are stripped before answer extraction."""
+        dataset = reasoning_gym.create_dataset("knights_knaves", size=1, seed=42)
+        entry = dataset[0]
+
+        # Simulate model wrapping answer in code fences
+        response = self._create_response(
+            text=f"```\n{entry['answer']}\n```",
+            msg_id="test_fence_strip",
+        )
+
+        verify_request = ReasoningGymVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(
+                input=[{"role": "user", "content": entry["question"]}]
+            ),
+            response=response,
+            question=entry["question"],
+            answer=entry["answer"],
+            metadata=entry["metadata"],
+        )
+
+        verify_response = await server.verify(verify_request)
+        assert verify_response.reward >= 0.9, f"Should score high after stripping code fences, got {verify_response.reward}"
+
+    @pytest.mark.asyncio
     async def test_reasoning_gym_verify_multiple_tasks(self, server):
         tasks_to_test = ["knights_knaves", "leg_counting", "basic_arithmetic"]
 

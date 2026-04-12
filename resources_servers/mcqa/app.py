@@ -285,6 +285,17 @@ class MCQAResourcesServer(SimpleResourcesServer):
                     if letter_up in allowed_letters:
                         pred = letter_up
 
+        # Fallback: try {X} curly brace format (e.g. "{G}")
+        if pred is None:
+            m = re.search(r"\{([A-J])\}", text)
+            if m and m.group(1).upper() in allowed_letters:
+                pred = m.group(1).upper()
+        # Fallback: try "The answer is: X" / "The answer is X" format
+        if pred is None:
+            m = re.search(r"[Tt]he answer is:?\s*([A-J])", text)
+            if m and m.group(1).upper() in allowed_letters:
+                pred = m.group(1).upper()
+
         is_correct = (pred == gold) if (pred is not None and gold) else False
         reward = 1.0 if is_correct else 0.0
 

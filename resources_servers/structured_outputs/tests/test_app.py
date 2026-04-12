@@ -587,3 +587,104 @@ class TestApp:
 
         no_coerce_verify_response = await no_coerce_server.verify(no_coerce_request)
         assert no_coerce_verify_response.reward == 0.0
+
+    async def test_verify_json_with_think_tags(self, config: StructuredOutputsResourcesServerConfig) -> None:
+        """Test that <think>...</think> tags are stripped before JSON parsing."""
+        server_mock = MagicMock(spec=ServerClient)
+        resources_server = StructuredOutputsResourcesServer(config=config, server_client=server_mock)
+
+        test_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+        }
+        valid_json = '{"name": "Alice", "age": 30}'
+        schema_str = json.dumps(test_schema)
+        dummy_create_params = NeMoGymResponseCreateParamsNonStreaming(input=[])
+
+        # Test 1: <think> prefix + valid JSON
+        think_json = "<think>Let me reason about the schema...</think>\n" + valid_json
+        output_item = self._create_response_output_message(think_json)
+        response = NeMoGymResponse(
+            id="think_json_id",
+            created_at=1234.5,
+            model="test_model",
+            object="response",
+            output=[output_item],
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+        request = StructuredOutputsVerifyRequest(
+            responses_create_params=dummy_create_params,
+            response=response,
+            schema_str=schema_str,
+            schema_type=SchemaType.JSON,
+        )
+        result = await resources_server.verify(request)
+        assert result.reward == 1.0, "Should pass after stripping <think> tags"
+
+        # Test 2: <think> prefix + markdown code fence + valid JSON
+        think_fence_json = "<think>Thinking hard...</think>\n```json\n" + valid_json + "\n```"
+        output_item2 = self._create_response_output_message(think_fence_json)
+        response2 = response.model_copy(deep=True, update={"id": "think_fence_json_id", "output": [output_item2]})
+        request2 = StructuredOutputsVerifyRequest(
+            responses_create_params=dummy_create_params,
+            response=response2,
+            schema_str=schema_str,
+            schema_type=SchemaType.JSON,
+        )
+        result2 = await resources_server.verify(request2)
+        assert result2.reward == 1.0, "Should pass after stripping <think> tags and code fences"
+
+        # Test 3: <think> prefix + genuinely invalid JSON → should still fail
+        think_bad_json = "<think>Hmm...</think>\n{invalid json"
+        output_item3 = self._create_response_output_message(think_bad_json)
+        response3 = response.model_copy(deep=True, update={"id": "think_bad_json_id", "output": [output_item3]})
+        request3 = StructuredOutputsVerifyRequest(
+            responses_create_params=dummy_create_params,
+            response=response3,
+            schema_str=schema_str,
+            schema_type=SchemaType.JSON,
+        )
+        result3 = await resources_server.verify(request3)
+        assert result3.reward == 0.0, "Invalid JSON should still fail even after stripping <think> tags"
+
+    async def test_verify_yaml_with_think_tags(self, config: StructuredOutputsResourcesServerConfig) -> None:
+        """Test that <think> tags are stripped for YAML schema type too."""
+        server_mock = MagicMock(spec=ServerClient)
+        resources_server = StructuredOutputsResourcesServer(config=config, server_client=server_mock)
+
+        test_schema = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+        }
+        valid_yaml = "name: Alice\nage: 30\n"
+        schema_str = json.dumps(test_schema)
+        dummy_create_params = NeMoGymResponseCreateParamsNonStreaming(input=[])
+
+        think_yaml = "<think>Let me think...</think>\n" + valid_yaml
+        output_item = self._create_response_output_message(think_yaml)
+        response = NeMoGymResponse(
+            id="think_yaml_id",
+            created_at=1234.5,
+            model="test_model",
+            object="response",
+            output=[output_item],
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+        request = StructuredOutputsVerifyRequest(
+            responses_create_params=dummy_create_params,
+            response=response,
+            schema_str=schema_str,
+            schema_type=SchemaType.YAML,
+        )
+        result = await resources_server.verify(request)
+        assert result.reward == 1.0, "YAML should pass after stripping <think> tags"

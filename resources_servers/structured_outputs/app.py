@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import re
 from enum import StrEnum
 from typing import Any, Dict
 
@@ -169,6 +170,11 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         try:
             schema = json.loads(schema_str)
             self.strictify_schema(schema)
+            # Strip <think>...</think> tags (thinking models emit these before content)
+            response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+            # Strip markdown code fences (e.g. ```json ... ```)
+            response_text = re.sub(r"^```(?:\w*)\s*\n?", "", response_text)
+            response_text = re.sub(r"\n?```\s*$", "", response_text)
             response_obj = self.parse_content(schema_type, response_text)
             if schema_type == SchemaType.XML and self.config.xml_coerce_types:
                 response_obj = self.coerce_xml_types(response_obj, schema)
