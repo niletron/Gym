@@ -257,6 +257,27 @@ class TestStructuredOutputsEdgeCases:
         result = await server.verify(request)
         assert result.reward == 1.0, "Multiple <think> blocks should all be stripped"
 
+    @pytest.mark.xfail(
+        reason="Known bug: <|im_end|> combined with <think> tags - both issues compound"
+    )
+    async def test_im_end_plus_think_tags_combined(self):
+        """RLVR1 BUG: Real-world scenario where model output has BOTH <think> tags
+        AND <|im_end|> token. This is the most common failure pattern in production
+        (95% of structured_outputs failures).
+        """
+        server = _make_structured_outputs_server()
+        valid_json = '{"name": "Alice", "age": 30}'
+        text = f"<think>Let me create the JSON...</think>\n{valid_json}<|im_end|>"
+
+        request = StructuredOutputsVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=_make_response(text),
+            schema_str=SIMPLE_JSON_SCHEMA,
+            schema_type=SchemaType.JSON,
+        )
+        result = await server.verify(request)
+        assert result.reward == 1.0, "Should strip both <think> tags and <|im_end|> before parsing"
+
     async def test_thinking_tag_variant(self):
         """RLVR1 edge case: Some models use <thinking> instead of <think>.
         The current grader only strips <think>...</think>, not <thinking>...</thinking>.
@@ -306,6 +327,35 @@ class TestMathBoxedExtractionEdgeCases:
         )
         result = _extract_boxed_answer(text)
         assert result == "59", "Should extract the LAST \\boxed{} value, not the first"
+
+    def test_multi_part_correct_answer_in_non_final_boxed(self):
+        """RLVR1 CRITICAL BUG: Multi-part problem where the correct answer appears in a
+        NON-FINAL \\boxed{}. The grader uses rfind (last \\boxed{}), so if the problem
+        asks for part (a) but the model also answers part (b) last, the grader extracts
+        the wrong value.
+
+        This was the #1 math grading bug (78% of 836 true bugs = 651 cases).
+        E.g., problem asks "find x", model writes \\boxed{3} for x then \\boxed{7} for y.
+        Label is "3" but grader extracts "7".
+        """
+        from resources_servers.math_with_code.app import _extract_boxed_answer
+
+        # Model correctly answers x=3 first, then also computes y=7
+        text = (
+            "For part (a), solving for x:\n"
+            "x = 3, so \\boxed{3}\n\n"
+            "For part (b), solving for y:\n"
+            "y = 7, so \\boxed{7}"
+        )
+        result = _extract_boxed_answer(text)
+        # Current behavior: extracts "7" (last boxed), but the label might be "3"
+        # This documents the bug: rfind always picks the last \\boxed{}, which is wrong
+        # for multi-part problems where the label corresponds to an earlier part
+        assert result == "7", (
+            "Current behavior: last \\boxed{} wins. This is a KNOWN BUG for multi-part "
+            "problems where the correct answer is in an earlier \\boxed{}. "
+            "Fix: try matching ALL \\boxed{} values against the label."
+        )
 
     def test_boxed_with_latex_thousand_separators(self):
         """RLVR1 pattern: Model uses LaTeX \\, for thousand separators inside \\boxed{}.
@@ -493,6 +543,28 @@ class TestMCQAEdgeCases:
         body = _make_mcqa_request(text=text, expected="B")
         result = await server.verify(body)
         assert result.extracted_answer == "B", "Should extract \\boxed{} OUTSIDE <think> tags"
+        assert result.reward == 1.0
+
+    @pytest.mark.xfail(
+        reason=(
+            "Known bug: 'Answer: X' format is not extracted in default strict_single_letter_boxed mode. "
+            "This accounts for 205 of 431 MCQA grading bugs (48%). Only caught in lenient_answer_colon mode."
+        )
+    )
+    async def test_answer_colon_format_in_default_mode(self):
+        """RLVR1 BUG: Model outputs 'Answer: B' but the default grading mode
+        (strict_single_letter_boxed) does not extract this format. The model gets
+        reward=0 despite having the correct answer.
+
+        This was the #1 MCQA grading bug (205 of 431 cases = 48%).
+        """
+        server = _make_mcqa_server()  # default mode = strict_single_letter_boxed
+        body = _make_mcqa_request(
+            text="After careful analysis of all options.\n\nAnswer: B",
+            expected="B",
+        )
+        result = await server.verify(body)
+        assert result.extracted_answer == "B", "Should extract 'Answer: X' even in default mode"
         assert result.reward == 1.0
 
     async def test_wrong_answer_any_format(self):
