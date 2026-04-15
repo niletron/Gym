@@ -237,3 +237,6 @@ env.yaml
 
 # Backup files
 *.backup
+
+# Backup files (additional)
+*.bak
