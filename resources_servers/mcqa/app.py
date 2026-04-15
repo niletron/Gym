@@ -231,6 +231,9 @@ class MCQAResourcesServer(SimpleResourcesServer):
         pred: Optional[str] = None
 
         text = body.response.output_text.strip()
+        # Strip <think>...</think> blocks before extraction so patterns don't
+        # match reasoning tokens that precede the real answer.
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         if not text:
             return MCQAVerifyResponse(
                 **body.model_dump(exclude={"expected_answer", "extracted_answer"}),
@@ -293,6 +296,11 @@ class MCQAResourcesServer(SimpleResourcesServer):
         # Fallback: try "The answer is: X" / "The answer is X" format
         if pred is None:
             m = re.search(r"[Tt]he answer is:?\s*([A-J])", text)
+            if m and m.group(1).upper() in allowed_letters:
+                pred = m.group(1).upper()
+        # Fallback: try "Answer: X" format (handles 48% of MCQA grading bugs)
+        if pred is None:
+            m = re.search(r"Answer:\s*([A-J])", text, re.IGNORECASE)
             if m and m.group(1).upper() in allowed_letters:
                 pred = m.group(1).upper()
 

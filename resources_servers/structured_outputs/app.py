@@ -172,6 +172,9 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
             self.strictify_schema(schema)
             # Strip <think>...</think> tags (thinking models emit these before content)
             response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+            # Strip chat template tokens (e.g. <|im_end|>, <|im_start|>, <|endoftext|>)
+            # vLLM/SGLang may append these during generation, causing JSON parse failures
+            response_text = re.sub(r"<\|[^|]*\|>", "", response_text).strip()
             # Strip markdown code fences (e.g. ```json ... ```)
             response_text = re.sub(r"^```(?:\w*)\s*\n?", "", response_text)
             response_text = re.sub(r"\n?```\s*$", "", response_text)

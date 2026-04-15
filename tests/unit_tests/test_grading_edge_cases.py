@@ -139,9 +139,6 @@ SIMPLE_JSON_SCHEMA = json.dumps(
 class TestStructuredOutputsEdgeCases:
     """Edge cases for structured_outputs grading discovered during RLVR1 training."""
 
-    @pytest.mark.xfail(
-        reason="Known bug: <|im_end|> token appended by vLLM is not stripped, causing valid JSON to fail parsing"
-    )
     async def test_im_end_token_should_be_stripped(self):
         """RLVR1 bug: vLLM appends <|im_end|> to model output. The grader should strip
         it before parsing, but currently does not, causing false negatives (reward=0 for
@@ -257,9 +254,6 @@ class TestStructuredOutputsEdgeCases:
         result = await server.verify(request)
         assert result.reward == 1.0, "Multiple <think> blocks should all be stripped"
 
-    @pytest.mark.xfail(
-        reason="Known bug: <|im_end|> combined with <think> tags - both issues compound"
-    )
     async def test_im_end_plus_think_tags_combined(self):
         """RLVR1 BUG: Real-world scenario where model output has BOTH <think> tags
         AND <|im_end|> token. This is the most common failure pattern in production
@@ -499,14 +493,6 @@ class TestMCQAEdgeCases:
         assert result.extracted_answer == "B"
         assert result.reward == 1.0
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known bug: MCQA grader does not strip <think> tags. "
-            "The 'The answer is X' fallback uses re.search (first match), "
-            "so it matches the WRONG answer inside <think> tags instead of "
-            "the correct answer outside."
-        )
-    )
     async def test_think_tags_correct_answer_outside_wrong_inside(self):
         """RLVR1 bug: Model reasons about option A inside <think> tags but concludes with B
         outside. The grader should grade based on the answer OUTSIDE <think> tags.
@@ -525,12 +511,6 @@ class TestMCQAEdgeCases:
         assert result.extracted_answer == "B", "Should extract answer OUTSIDE <think> tags"
         assert result.reward == 1.0
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known bug: MCQA strict_single_letter_boxed uses re.search (first match), "
-            "so \\boxed{A} inside <think> tags takes precedence over \\boxed{B} outside."
-        )
-    )
     async def test_think_tags_boxed_correct_outside_wrong_inside(self):
         """RLVR1 bug: \\boxed{} inside <think> tags should be ignored in favor of
         \\boxed{} outside <think> tags.
@@ -545,12 +525,6 @@ class TestMCQAEdgeCases:
         assert result.extracted_answer == "B", "Should extract \\boxed{} OUTSIDE <think> tags"
         assert result.reward == 1.0
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known bug: 'Answer: X' format is not extracted in default strict_single_letter_boxed mode. "
-            "This accounts for 205 of 431 MCQA grading bugs (48%). Only caught in lenient_answer_colon mode."
-        )
-    )
     async def test_answer_colon_format_in_default_mode(self):
         """RLVR1 BUG: Model outputs 'Answer: B' but the default grading mode
         (strict_single_letter_boxed) does not extract this format. The model gets
@@ -979,7 +953,6 @@ class TestImEndTokenHandling:
     in environments that parse the response as JSON or apply regex patterns.
     """
 
-    @pytest.mark.xfail(reason="Known bug: <|im_end|> not stripped in structured_outputs")
     async def test_structured_outputs_json_with_im_end(self):
         """structured_outputs: <|im_end|> appended to valid JSON causes parse failure."""
         server = _make_structured_outputs_server()
