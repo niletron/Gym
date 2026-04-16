@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 from typing import List, Literal
 
 from fastapi import FastAPI
@@ -24,6 +25,22 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+
+
+REFUSAL_PATTERNS = [
+    r"(?i)^[\s]*(?:I\s+)?(?:cannot|can't|will not|won't|am unable to|refuse to)",
+    r"(?i)^[\s]*(?:sorry|apologies|I\s+apologize)",
+    r"(?i)^[\s]*(?:as an ai|I'm an ai|I am an ai)",
+]
+
+
+def _is_refusal(text: str, min_content_length: int = 150) -> bool:
+    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if len(stripped) < min_content_length:
+        for pattern in REFUSAL_PATTERNS:
+            if re.search(pattern, stripped):
+                return True
+    return False
 
 
 class InstructionFollowingResourcesServerConfig(BaseResourcesServerConfig):
@@ -142,6 +159,9 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
             reward = float((sum(is_following_list) / len(is_following_list)) if is_following_list else 0.0)
         else:
             raise ValueError(f"Invalid reward mode: {reward_mode}")
+
+        if reward > 0 and _is_refusal(final_response_text):
+            reward = 0.0
 
         return InstructionFollowingVerifyResponse(
             **body.model_dump(),

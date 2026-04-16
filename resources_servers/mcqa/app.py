@@ -230,7 +230,28 @@ class MCQAResourcesServer(SimpleResourcesServer):
 
         pred: Optional[str] = None
 
-        text = body.response.output_text.strip()
+        raw_text = body.response.output_text.strip()
+        think_match = re.search(r"<think>(.*?)</think>", raw_text, flags=re.DOTALL)
+        refusal_in_think = False
+        if think_match:
+            think_content = think_match.group(1).strip().lower()
+            refusal_phrases = [
+                "i cannot",
+                "i can't",
+                "i'm unable",
+                "i refuse",
+                "not appropriate",
+                "cannot comply",
+                "can't comply",
+                "decline",
+                "不能",
+                "无法",
+                "抱歉",
+            ]
+            if any(phrase in think_content for phrase in refusal_phrases) and len(think_content) < 500:
+                refusal_in_think = True
+
+        text = raw_text
         # Strip <think>...</think> blocks before extraction so patterns don't
         # match reasoning tokens that precede the real answer.
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
@@ -306,6 +327,9 @@ class MCQAResourcesServer(SimpleResourcesServer):
 
         is_correct = (pred == gold) if (pred is not None and gold) else False
         reward = 1.0 if is_correct else 0.0
+
+        if refusal_in_think and reward > 0:
+            reward = 0.0
 
         return MCQAVerifyResponse(
             **body.model_dump(exclude={"expected_answer", "extracted_answer"}),
