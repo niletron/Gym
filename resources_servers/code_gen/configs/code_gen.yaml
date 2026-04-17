@@ -9,6 +9,7 @@ code_gen:
       value: Improve competitive coding capabilities
       num_processes: 8
       unit_test_timeout_secs: 10
+      global_timeout_secs: 90
       debug: false
 code_gen_simple_agent:
   responses_api_agents:

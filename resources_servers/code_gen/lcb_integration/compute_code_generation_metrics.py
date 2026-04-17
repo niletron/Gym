@@ -58,15 +58,29 @@ _CODE_GEN_DIR = str(Path(__file__).parent.parent)
         "env_vars": {"PYTHONPATH": _CODE_GEN_DIR},
     },
 )
-def check_correctness_remote(sample, generation, timeout, debug=True):
+def check_correctness_remote(sample, generation, timeout, debug=True, global_timeout=None):
     """Ray wrapper of check_correctness for remote execution."""
-    return check_correctness(sample, generation, timeout, debug)
+    return check_correctness(sample, generation, timeout, debug, global_timeout=global_timeout)
 
 
-def check_correctness(sample, generation, timeout, debug=True):
+def check_correctness(sample, generation, timeout, debug=True, global_timeout=None):
     """Check correctness of code generation with a global timeout.
+
     The global timeout is to catch some extreme/rare cases not handled by the timeouts
-    inside `run_test`"""
+    inside `run_test`.
+
+    Args:
+        sample: Dict with "input_output" key containing JSON-encoded test cases.
+        generation: The generated code string to test.
+        timeout: Per-test-case timeout in seconds (used by signal.alarm inside run_test).
+        debug: Whether to print debug output.
+        global_timeout: Optional hard cap on total Process.join time in seconds.
+            When set, the process join timeout is capped at this value regardless
+            of test count, preventing the formula-based timeout
+            ``(timeout+1)*N+5`` from exceeding the caller's HTTP timeout budget.
+            Recommended: set to ~90s when the HTTP caller has a 120s timeout,
+            leaving headroom for Ray overhead and result serialization.
+    """
 
     # Parse JSON once at the beginning to avoid multiple parsing
     try:
@@ -82,7 +96,9 @@ def check_correctness(sample, generation, timeout, debug=True):
         args=(in_outs, generation, debug, result, metadata_list, timeout),
     )
     p.start()
-    p.join(timeout=(timeout + 1) * len(in_outs["inputs"]) + 5)
+    formula_timeout = (timeout + 1) * len(in_outs["inputs"]) + 5
+    effective_timeout = min(formula_timeout, global_timeout) if global_timeout else formula_timeout
+    p.join(timeout=effective_timeout)
     if p.is_alive():
         p.kill()
     if not result:
@@ -90,7 +106,9 @@ def check_correctness(sample, generation, timeout, debug=True):
         result = [[-1 for i in range(len(in_outs["inputs"]))]]
         metadata_list = [None]
         if debug:
-            print("global timeout")
+            print(
+                f"global timeout (effective={effective_timeout}s, formula={formula_timeout}s, cap={global_timeout}s)"
+            )
     return result[0], metadata_list[0]
 
 

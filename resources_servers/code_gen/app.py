@@ -45,6 +45,20 @@ class CompCodingResourcesServerConfig(BaseResourcesServerConfig):
     unit_test_timeout_secs: int
     debug: bool
     reasoning_format_penalty: float = -0.2
+    global_timeout_secs: int = 90
+    """Hard cap on total Process.join time for test execution (seconds).
+
+    Prevents the formula-based timeout ``(unit_test_timeout_secs+1)*N+5``
+    from exceeding the caller's HTTP timeout (default 120s in routing_rm).
+    Set to ~90s to leave headroom for Ray scheduling, result serialization,
+    and async overhead.
+
+    With the default value of 90s and unit_test_timeout_secs=10:
+    - Problems with <= 7 test cases use the formula timeout (< 90s)
+    - Problems with >= 8 test cases are capped at 90s
+    - This prevents the 73.3% of RLVR1_v2 samples with >= 11 test cases
+      from exceeding the 120s HTTP timeout
+    """
 
 
 # ----------------------------
@@ -204,6 +218,7 @@ class CompCodingResourcesServer(SimpleResourcesServer):
                 code,  # generation
                 self.config.unit_test_timeout_secs,  # timeout
                 self.config.debug,  # debug
+                self.config.global_timeout_secs,  # global_timeout
             )
 
             future = check_correctness_remote.remote(*task_args)
