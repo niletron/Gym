@@ -8,7 +8,7 @@ code_gen:
       description: Model must submit the right code to solve a problem
       value: Improve competitive coding capabilities
       num_processes: 8
-      unit_test_timeout_secs: 10
+      unit_test_timeout_secs: 3
       global_timeout_secs: 90
       debug: false
 code_gen_simple_agent:
