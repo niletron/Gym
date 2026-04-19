@@ -12,8 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import concurrent.futures as cf
 import contextlib
 import logging
+import multiprocessing as mp
+import os
+import signal
 from io import StringIO
 from typing import Any, ClassVar, Dict, List, Optional, Union
 
@@ -39,6 +44,77 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.reward_profile import compute_pass_majority_metrics, highest_k_metrics
 from nemo_gym.server_utils import get_response_json
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-isolated math_verify worker
+#
+# math_verify descends into sympy C-extension recursion (factorials, Sum.doit,
+# simplify on tower exponents). Its internal SIGALRM timeout cannot preempt
+# C-extension frames, so a poison payload wedges the entire async event loop
+# indefinitely. We isolate each verify call in a worker process so a timeout
+# can be enforced by SIGKILLing the worker. See MATH_OUTAGE_RCA.md.
+# ---------------------------------------------------------------------------
+
+_WORKER_VERIFIER = None
+
+
+def _worker_init():
+    """Initializer run once per worker process. Imports math_verify eagerly so
+    the per-call overhead is just function dispatch."""
+    global _WORKER_VERIFIER
+    from math_verify.metric import math_metric as _mm
+    from math_verify.parser import (
+        ExprExtractionConfig as _EC,
+        LatexExtractionConfig as _LC,
+    )
+
+    logging.getLogger("math_verify").setLevel(logging.CRITICAL)
+    _WORKER_VERIFIER = _mm(
+        gold_extraction_target=(_LC(),),
+        pred_extraction_target=(_EC(), _LC()),
+    )
+
+
+def _strip_math_delimiters_plain(s: str) -> str:
+    s = s.strip()
+    if s.startswith("\\(") and s.endswith("\\)"):
+        s = s[2:-2].strip()
+    if s.startswith("$") and s.endswith("$") and len(s) > 1:
+        s = s[1:-1].strip()
+    return s
+
+
+def _verify_in_worker(expected_answer: str, generated_answer: str):
+    """Run math_verify grading in the current (worker) process. Returns
+    (reward, extracted_answer) or raises on failure."""
+    global _WORKER_VERIFIER
+    if _WORKER_VERIFIER is None:
+        _worker_init()
+
+    from math_verify import grader as _grader
+    from math_verify.errors import TimeoutException as _TO
+
+    try:
+        stripped = _strip_math_delimiters_plain(expected_answer)
+        ground_truth_parsable = "\\boxed{" + stripped + "}"
+        ret_score, extracted_answer = _WORKER_VERIFIER(
+            [ground_truth_parsable], [generated_answer]
+        )
+        reward = float(ret_score)
+
+        ea: Optional[str] = None
+        if extracted_answer is not None and len(extracted_answer) == 2:
+            extracted_gold, extracted_prediction = extracted_answer
+            for pred in extracted_prediction:
+                if any(_grader.verify(gold, pred) for gold in extracted_gold):
+                    ea = pred
+                    break
+            else:
+                ea = extracted_prediction[0] if extracted_prediction else None
+        return reward, ea
+    except (Exception, _TO):
+        return 0.0, None
 
 
 class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
@@ -95,13 +171,18 @@ Example output: "My final verdict is different [[A!=B]]"."""
 
     config: LibraryJudgeMathResourcesServerConfig
 
+    # Process-pool isolation for math_verify. Tunable via env vars so ops can
+    # adjust without code changes.
+    _VERIFY_TIMEOUT_S: ClassVar[float] = float(os.environ.get("MATH_VERIFY_TIMEOUT_S", "10"))
+    _VERIFY_POOL_WORKERS: ClassVar[int] = int(os.environ.get("MATH_VERIFY_POOL_WORKERS", "4"))
+
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
 
         logging.getLogger("math_verify").setLevel(logging.CRITICAL)
 
-        # Use Latex and plain math extraction from predictions
-        # https://github.com/huggingface/Math-Verify?tab=readme-ov-file#extraction-targets
+        # Kept for the (synchronous) in-process fallback path only; the hot
+        # path now dispatches to a worker pool.
         self._library_verifier = math_metric(
             gold_extraction_target=(LatexExtractionConfig(),),
             pred_extraction_target=(
@@ -109,6 +190,49 @@ Example output: "My final verdict is different [[A!=B]]"."""
                 LatexExtractionConfig(),
             ),
         )
+
+        self._verify_pool: Optional[cf.ProcessPoolExecutor] = None
+        self._verify_pool_lock: Optional[asyncio.Lock] = None
+
+    def _build_pool(self) -> cf.ProcessPoolExecutor:
+        return cf.ProcessPoolExecutor(
+            max_workers=self._VERIFY_POOL_WORKERS,
+            mp_context=mp.get_context("spawn"),
+            initializer=_worker_init,
+        )
+
+    def _ensure_pool(self) -> cf.ProcessPoolExecutor:
+        if self._verify_pool is None:
+            self._verify_pool = self._build_pool()
+        if self._verify_pool_lock is None:
+            self._verify_pool_lock = asyncio.Lock()
+        return self._verify_pool
+
+    def _recycle_pool(self) -> None:
+        """SIGKILL all workers of the current pool and replace it. Called when
+        a verify call times out, which can only mean a worker is wedged inside
+        sympy's C-extension recursion where SIGTERM won't land."""
+        old = self._verify_pool
+        self._verify_pool = self._build_pool()
+        if old is None:
+            return
+        pids = []
+        try:
+            pids = list(getattr(old, "_processes", {}).keys())
+        except Exception:
+            pids = []
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception as exc:
+                logging.warning("math_verify pool recycle: SIGKILL %s failed: %s", pid, exc)
+        try:
+            old.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        logging.warning("math_verify pool recycled after timeout (killed %d workers)", len(pids))
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -154,7 +278,7 @@ Example output: "My final verdict is different [[A!=B]]"."""
         specified question in comparison with the specified expected answer.
         """
 
-        library_reward, extracted_answer = self._verify_answer_with_library(expected_answer, generated_answer)
+        library_reward, extracted_answer = await self._verify_answer_with_library(expected_answer, generated_answer)
         if not self.config.should_use_judge or library_reward > 0.5:
             return library_reward, extracted_answer, library_reward, None
 
@@ -187,40 +311,33 @@ Example output: "My final verdict is different [[A!=B]]"."""
             s = s[1:-1].strip()
         return s
 
-    def _verify_answer_with_library(self, expected_answer: str, generated_answer: str) -> tuple[float, Optional[str]]:
-        # This functionality is migrated from Nemo RL.
-        # https://github.com/NVIDIA-NeMo/RL/blob/e1f56c42ae175d3863ccaf4e21b7de7e9c46c2e1/nemo_rl/environments/math_environment.py
+    async def _verify_answer_with_library(
+        self, expected_answer: str, generated_answer: str
+    ) -> tuple[float, Optional[str]]:
+        # Dispatched to a subprocess pool so we can SIGKILL workers that wedge
+        # inside math_verify's sympy C-extension recursion. See
+        # MATH_OUTAGE_RCA.md for why SIGALRM-based timeouts fail here.
+        pool = self._ensure_pool()
+        loop = asyncio.get_running_loop()
         try:
-            stripped = self._strip_math_delimiters(expected_answer)
-            ground_truth_parsable = "\\boxed{" + stripped + "}"
-            with self._mute_output():
-                ret_score, extracted_answer = self._library_verifier([ground_truth_parsable], [generated_answer])
-
-            reward = float(ret_score)
-
-            if extracted_answer is not None:
-                # Make sure the extracted answer has two elements.
-                assert len(extracted_answer) == 2
-
-                extracted_gold, extracted_prediction = extracted_answer
-
-                # Get the extracted answer.
-                for pred in extracted_prediction:
-                    if any(grader.verify(gold, pred) for gold in extracted_gold):
-                        extracted_answer = pred
-                        break
-                else:
-                    # If no match is found, that means all the answers are
-                    # incorrect.  The first prediction is used as the extracted
-                    # answer.
-                    extracted_answer = extracted_prediction[0] if extracted_prediction else None
-
-            return reward, extracted_answer
-
-        # It's possible to emit a TimeoutException and that wouldn't be caught since
-        # it actually subclasses from BaseException and math-verify itself does not
-        # catch it.
-        except (Exception, TimeoutException):
+            fut = loop.run_in_executor(pool, _verify_in_worker, expected_answer, generated_answer)
+            return await asyncio.wait_for(fut, timeout=self._VERIFY_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logging.warning(
+                "math_verify timeout (%.1fs) on expected=%r — recycling pool",
+                self._VERIFY_TIMEOUT_S,
+                expected_answer[:80],
+            )
+            async with self._verify_pool_lock:
+                self._recycle_pool()
+            return 0.0, None
+        except (cf.process.BrokenProcessPool, cf.CancelledError):
+            logging.warning("math_verify worker died — recycling pool")
+            async with self._verify_pool_lock:
+                self._recycle_pool()
+            return 0.0, None
+        except (Exception, TimeoutException) as exc:
+            logging.warning("math_verify error: %s", exc)
             return 0.0, None
 
     async def _verify_answer_with_judge(

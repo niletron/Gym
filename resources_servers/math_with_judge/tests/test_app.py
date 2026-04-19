@@ -308,41 +308,74 @@ class TestApp:
             second_judge_equal_item,
         )
 
-    def test_verify_answer_with_library(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
+    async def test_verify_answer_with_library(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
         resources_server = LibraryJudgeMathResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
-        assert resources_server._verify_answer_with_library("4", "2 + 2 = \\boxed{4}") == (approx(1.0), "4")
-        assert resources_server._verify_answer_with_library("\\boxed{12}", "3 * 4 = \\boxed{12}") == (
+        assert await resources_server._verify_answer_with_library("4", "2 + 2 = \\boxed{4}") == (approx(1.0), "4")
+        assert await resources_server._verify_answer_with_library("\\boxed{12}", "3 * 4 = \\boxed{12}") == (
             approx(1.0),
             "12",
         )
-        assert resources_server._verify_answer_with_library("\\boxed{5}", "10 - 5 = \\boxed{5}") == (approx(1.0), "5")
-        assert resources_server._verify_answer_with_library("4.0", "2 + 2 = \\boxed{\\frac{8}{2}}") == (
+        assert await resources_server._verify_answer_with_library("\\boxed{5}", "10 - 5 = \\boxed{5}") == (
+            approx(1.0),
+            "5",
+        )
+        assert await resources_server._verify_answer_with_library("4.0", "2 + 2 = \\boxed{\\frac{8}{2}}") == (
             approx(1.0),
             "4",
         )
 
-        assert resources_server._verify_answer_with_library("\\boxed{12}", "3 * 4 = 13") == (approx(0.0), "13")
-        assert resources_server._verify_answer_with_library("17.001", "17") == (
+        assert await resources_server._verify_answer_with_library("\\boxed{12}", "3 * 4 = 13") == (approx(0.0), "13")
+        assert await resources_server._verify_answer_with_library("17.001", "17") == (
             approx(0.0),
             "17",
         )
 
-        assert resources_server._verify_answer_with_library("", "") == (
+        assert await resources_server._verify_answer_with_library("", "") == (
             approx(0.0),
             None,
         )
 
-        assert resources_server._verify_answer_with_library("3", "3") == (
+        assert await resources_server._verify_answer_with_library("3", "3") == (
             approx(1.0),
             "3",
         )
-        timeout_mock = MagicMock(side_effect=TimeoutException())
-        resources_server._library_verifier = timeout_mock
-        assert resources_server._verify_answer_with_library("3", "3") == (
-            approx(0.0),
-            None,
-        )
+
+    async def test_verify_answer_with_library_timeout_recycles_pool(
+        self, config: LibraryJudgeMathResourcesServerConfig
+    ) -> None:
+        """A poison payload that wedges a worker must timeout and yield (0.0, None)
+        without hanging the event loop, and the pool must be recycled so the next
+        call still works. This is the failure mode that caused the step-375 math
+        outage (MATH_OUTAGE_RCA.md)."""
+        import asyncio as _asyncio
+
+        from unittest.mock import patch
+
+        resources_server = LibraryJudgeMathResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+        # Pre-warm the pool with a normal call.
+        assert await resources_server._verify_answer_with_library("4", "\\boxed{4}") == (approx(1.0), "4")
+        pool_before = resources_server._verify_pool
+
+        # Simulate the step-375 failure mode: math_verify is wedged inside a C
+        # extension and the call never returns. Mock asyncio.wait_for so it
+        # raises TimeoutError — this is the same signal the production path
+        # sees when a subprocess worker is stuck. The handler must
+        #   (a) return (0.0, None),
+        #   (b) recycle the pool (SIGKILL + replace), and
+        #   (c) keep the server responsive for subsequent calls.
+        with patch(
+            "resources_servers.math_with_judge.app.asyncio.wait_for",
+            side_effect=_asyncio.TimeoutError(),
+        ):
+            reward, extracted = await resources_server._verify_answer_with_library("4", "\\boxed{4}")
+            assert reward == 0.0
+            assert extracted is None
+
+        # Pool must have been recycled — the old executor is gone, new one in place.
+        assert resources_server._verify_pool is not pool_before
+        # And the next (unmocked) call must still succeed.
+        assert await resources_server._verify_answer_with_library("4", "\\boxed{4}") == (approx(1.0), "4")
 
     async def test_verify_answer_with_judge(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
         server_mock = MagicMock(spec=ServerClient)
