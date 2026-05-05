@@ -12,8 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# ---------------------------------------------------------------------------
+# IF graders run verifiable_instructions checks that can call regex on
+# untrusted model output (e.g. length/format constraints with user-supplied
+# patterns). Catastrophic backtracking here would hang the server. Isolate
+# the full check loop in a subprocess pool.
+# ---------------------------------------------------------------------------
+
 import re
-from typing import List, Literal
+from typing import Any, ClassVar, List, Literal, Tuple
 
 from fastapi import FastAPI
 from verifiable_instructions import instructions_registry
@@ -25,6 +33,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.grader_pool import GraderPool
 
 
 REFUSAL_PATTERNS = [
@@ -41,6 +50,46 @@ def _is_refusal(text: str, min_content_length: int = 150) -> bool:
             if re.search(pattern, stripped):
                 return True
     return False
+
+
+def _check_in_worker(
+    final_response_text: str,
+    instruction_id_list: List[str],
+    kwargs_list: List,
+    grading_mode: str,
+) -> Tuple[float, List[bool]]:
+    """Run the full instruction-following check loop in a worker process.
+
+    Returns (reward, is_following_list). Returns (0.0, [False]*N) on any
+    catastrophic failure. Individual instruction errors still yield False
+    via the inner try-except."""
+    try:
+        is_following_list: List[bool] = []
+        for instruction_id, kwargs in zip(instruction_id_list, kwargs_list):
+            try:
+                instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+                instruction = instruction_cls(instruction_id)
+                if kwargs is None:
+                    kwargs = {}
+                filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+                instruction.build_description(**filtered_kwargs)
+                is_following_list.append(bool(instruction.check_following(final_response_text)))
+            except Exception:
+                is_following_list.append(False)
+
+        if grading_mode == "binary":
+            reward = float(all(is_following_list))
+        elif grading_mode == "fraction":
+            reward = float((sum(is_following_list) / len(is_following_list)) if is_following_list else 0.0)
+        else:
+            reward = 0.0
+
+        if reward > 0 and _is_refusal(final_response_text):
+            reward = 0.0
+
+        return reward, is_following_list
+    except BaseException:
+        return 0.0, [False] * len(instruction_id_list)
 
 
 class InstructionFollowingResourcesServerConfig(BaseResourcesServerConfig):
@@ -77,9 +126,21 @@ class InstructionFollowingVerifyResponse(BaseVerifyResponse):
 class InstructionFollowingResourcesServer(SimpleResourcesServer):
     config: InstructionFollowingResourcesServerConfig
 
+    _POOL: ClassVar[GraderPool] = GraderPool(
+        name="instruction_following",
+        timeout_s_env="IF_VERIFY_TIMEOUT_S",
+        workers_env="IF_POOL_WORKERS",
+        default_timeout_s=8.0,  # routing_rm timeout is 10s
+        default_workers=4,
+    )
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._ensure_nltk_data()
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        self._POOL.bind(self)
 
     def _ensure_nltk_data(self):
         """Ensure required NLTK data is available at startup.
@@ -104,6 +165,19 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
 
+        @app.get("/health")
+        async def health():
+            """End-to-end probe: run a trivial known-good check through the pool."""
+            (reward, _), reason = await self._POOL.run_or_zero(
+                self,
+                _check_in_worker,
+                "hello world",
+                [],  # no instructions → reward=1.0 (all([])==True)
+                [],
+                "binary",
+            )
+            return {"status": "ok" if reason == "ok" else reason, "reward": reward}
+
         return app
 
     async def verify(self, body: InstructionFollowingVerifyRequest) -> InstructionFollowingVerifyResponse:
@@ -115,58 +189,28 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
                 # Extract text from the nested content structure
                 final_response_text = last_output.content[0].text
 
-        # Strip leading/trailing whitespace to prevent paragraph off-by-one errors
-        # (e.g. leading \n\n from <think> tag removal creates an empty first paragraph)
         final_response_text = final_response_text.strip()
 
-        # Verify each instruction using the verifiable instructions
-        instruction_list = body.instruction_id_list
-        kwargs_list = body.kwargs
-        is_following_list = []
-
-        for instruction_id, kwargs in zip(instruction_list, kwargs_list):
-            try:
-                # Create instruction instance
-                instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
-                instruction = instruction_cls(instruction_id)
-
-                # Handle None kwargs
-                if kwargs is None:
-                    kwargs = {}
-
-                # Filter out None values from kwargs
-                filtered_kwargs = {k: v for k, v in kwargs.items() if v is not None}
-
-                # Build the instruction description with the provided kwargs
-                instruction.build_description(**filtered_kwargs)
-
-                # Check if the response follows the instruction
-                if instruction.check_following(final_response_text):
-                    is_following_list.append(True)
-                else:
-                    is_following_list.append(False)
-
-            except Exception as e:
-                # If there's an error processing the instruction, mark as failed
-                print(f"Error processing instruction {instruction_id}: {e}")
-                is_following_list.append(False)
-
-        # Calculate overall success
         reward_mode = getattr(body, "grading_mode", "binary")
-        if reward_mode == "binary":
-            reward = float(all(is_following_list))
-        elif reward_mode == "fraction":
-            reward = float((sum(is_following_list) / len(is_following_list)) if is_following_list else 0.0)
-        else:
+        if reward_mode not in ("binary", "fraction"):
             raise ValueError(f"Invalid reward mode: {reward_mode}")
 
-        if reward > 0 and _is_refusal(final_response_text):
-            reward = 0.0
+        # Dispatch to pool: the whole check loop, including per-instruction
+        # regex work, runs in a worker we can SIGKILL.
+        (reward, is_following_list), _reason = await self._POOL.run_or_zero(
+            self,
+            _check_in_worker,
+            final_response_text,
+            list(body.instruction_id_list),
+            list(body.kwargs),
+            reward_mode,
+            zero_value=(0.0, [False] * len(body.instruction_id_list)),
+        )
 
         return InstructionFollowingVerifyResponse(
             **body.model_dump(),
             reward=float(reward),
-            follow_all_instructions=all(is_following_list),
+            follow_all_instructions=all(is_following_list) if is_following_list else False,
             follow_instruction_list=is_following_list,
         )
 

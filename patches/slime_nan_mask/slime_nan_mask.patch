@@ -1,0 +1,367 @@
+# Slime NaN-reward masking patch
+# Generated: 2026-05-05
+# Purpose: treat float('nan') from custom_rm as sample-level mask
+#   - Sets sample.remove_sample=True (downstream zeros loss_mask)
+#   - Fills NaN with group-local mean so GRPO/GSPO stays clean
+# See slime_integration/routing_rm.py for the NaN-emitting side.
+#
+# Apply on a slime checkout with:
+#     cd /root/slime   # (or wherever slime is installed)
+#     git apply --check /tmp/slime_nan_mask.patch
+#     git apply        /tmp/slime_nan_mask.patch
+#
+# Roll back with:
+#     git apply --reverse /tmp/slime_nan_mask.patch
+#
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index 8f266ab0..f7f108db 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -306,6 +306,16 @@ class RolloutManager:
+             return self.custom_reward_post_process_func(self.args, samples)
+ 
+         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
++
++        # NaN-as-mask: if the custom_rm returned float('nan') for a sample
++        # (grader timeout / HTTP error / wedged pool), mark the sample with
++        # remove_sample=True and replace NaN with the group-local mean so
++        # group normalization stays clean. See slime/utils/nan_masking.py
++        # for the contract; see slime_integration/routing_rm.py for the
++        # NaN-emitting side.
++        from slime.utils.nan_masking import apply_nan_mask
++        raw_rewards = apply_nan_mask(samples, raw_rewards, self.args.n_samples_per_prompt)
++
+         if (
+             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+             and self.args.rewards_normalization
+diff --git a/slime/utils/nan_masking.py b/slime/utils/nan_masking.py
+new file mode 100644
+index 00000000..f8c7f1b8
+--- /dev/null
++++ b/slime/utils/nan_masking.py
+@@ -0,0 +1,89 @@
++"""NaN-as-mask handling for custom_rm reward failures.
++
++Extracted to a dedicated module with minimal (stdlib-only) dependencies so
++it's unit-testable without the full slime/Ray/Megatron stack.
++
++Contract (mirrors the one documented in slime/ray/rollout.py):
++
++  * A custom_rm that returns ``float('nan')`` signals "this sample could
++    not be graded" (timeout, HTTP error, wedged grader).
++  * NaN rewards must:
++      1. Set ``sample.remove_sample = True`` — which downstream zeros
++         ``loss_mask`` and makes the policy loss zero for those tokens.
++      2. Be replaced with the mean of non-NaN peers in the SAME prompt
++         group, so ``reward - group_mean == 0`` for the filled sample and
++         group statistics (GRPO/GSPO) aren't biased.
++      3. Fall back to ``0.0`` fill when an entire group is NaN (grader
++         fully dead). The remove_sample flag still prevents gradient.
++
++The only thing the caller has to do is pass the sample list, the raw
++rewards, and ``n_samples_per_prompt``; this function mutates both lists
++in place and returns the (now NaN-free) raw_rewards for downstream
++tensoring.
++"""
++
++from __future__ import annotations
++
++import math
++from typing import Any, List
++
++
++def apply_nan_mask(
++    samples: List[Any],
++    raw_rewards: List[float],
++    n_samples_per_prompt: int,
++) -> List[float]:
++    """Mark NaN samples with ``remove_sample=True`` and replace NaN rewards
++    with their group-local mean (or 0.0 if the group is all-NaN).
++
++    Args:
++        samples: list of Sample objects (must have ``remove_sample`` attr).
++        raw_rewards: list[float] aligned 1:1 with samples. Mutated in place.
++        n_samples_per_prompt: group size (GRPO/GSPO). If the sample count
++            isn't a clean multiple of this, falls back to batch-wide fill.
++
++    Returns:
++        raw_rewards with NaN replaced. (Also mutates in place.)
++    """
++    nan_indices = [
++        i for i, r in enumerate(raw_rewards)
++        if isinstance(r, float) and math.isnan(r)
++    ]
++    if not nan_indices:
++        return raw_rewards
++
++    # 1) Mark samples — this is what downstream _convert_samples_to_train_data
++    # reads to zero out loss_mask. That is the actual mask.
++    for i in nan_indices:
++        samples[i].remove_sample = True
++
++    # 2) Fill NaN with a group-safe value so the tensor math doesn't crash
++    # and so group statistics aren't polluted by an arbitrary value.
++    total = len(raw_rewards)
++    if n_samples_per_prompt and total % n_samples_per_prompt == 0:
++        # Group-local fill: fill = mean of non-NaN values in THIS group.
++        # Advantage for the filled sample: reward - group_mean == 0.
++        for start in range(0, total, n_samples_per_prompt):
++            group = raw_rewards[start:start + n_samples_per_prompt]
++            valid = [r for r in group
++                     if not (isinstance(r, float) and math.isnan(r))]
++            fill = (sum(valid) / len(valid)) if valid else 0.0
++            for j in range(start, start + n_samples_per_prompt):
++                if isinstance(raw_rewards[j], float) and math.isnan(raw_rewards[j]):
++                    raw_rewards[j] = fill
++    else:
++        # Variable or unknown group size: fall back to batch-wide mean.
++        # Still safe — remove_sample zeros the loss regardless of fill value.
++        valid = [r for r in raw_rewards
++                 if not (isinstance(r, float) and math.isnan(r))]
++        fill = (sum(valid) / len(valid)) if valid else 0.0
++        for i in range(len(raw_rewards)):
++            if isinstance(raw_rewards[i], float) and math.isnan(raw_rewards[i]):
++                raw_rewards[i] = fill
++
++    return raw_rewards
++
++
++def count_nan_samples(raw_rewards: List[float]) -> int:
++    """Return the number of NaN entries in raw_rewards."""
++    return sum(1 for r in raw_rewards if isinstance(r, float) and math.isnan(r))
+diff --git a/tests/test_nan_reward_masking.py b/tests/test_nan_reward_masking.py
+new file mode 100644
+index 00000000..dd6b2f3f
+--- /dev/null
++++ b/tests/test_nan_reward_masking.py
+@@ -0,0 +1,230 @@
++"""Tests for the NaN-as-mask contract in slime/utils/nan_masking.py.
++
++Background: the Gym custom_rm (``slime_integration/routing_rm.py``) returns
++``float('nan')`` when a grader times out or errors. slime's
++``_post_process_rewards`` calls ``apply_nan_mask`` to:
++
++  1. Mark each NaN sample with ``sample.remove_sample = True``, which
++     downstream zeros the sample's ``loss_mask`` (→ zero gradient from the
++     policy loss for those tokens). This is the actual mask.
++  2. Replace the NaN in ``raw_rewards`` with the GROUP-LOCAL mean (mean
++     of non-NaN peers in the same prompt group), so GRPO/GSPO group
++     normalization isn't poisoned by NaN or by a batch-wide fill that
++     would bias the group mean.
++
++These tests pin both behaviors. They use the helper in isolation to avoid
++importing slime.ray.rollout (which needs Ray + Megatron at import time).
++
++Run::
++
++    pytest tests/test_nan_reward_masking.py -v
++"""
++
++from __future__ import annotations
++
++import math
++from typing import List
++
++import pytest
++
++from slime.utils.nan_masking import apply_nan_mask, count_nan_samples
++
++
++class _FakeSample:
++    """Minimal stand-in with just the attribute apply_nan_mask mutates."""
++
++    def __init__(self):
++        self.remove_sample = False
++
++
++def _samples(n: int) -> List[_FakeSample]:
++    return [_FakeSample() for _ in range(n)]
++
++
++# ---------------------------------------------------------------------------
++# Mark-remove-sample behavior
++# ---------------------------------------------------------------------------
++
++
++class TestNaNMarksRemoveSample:
++    def test_single_nan_marks_only_that_sample(self):
++        samples = _samples(4)
++        rewards = [1.0, 0.0, float("nan"), 1.0]
++        apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert samples[2].remove_sample is True
++        for i in (0, 1, 3):
++            assert samples[i].remove_sample is False, f"sample {i} should not be masked"
++
++    def test_multiple_nan_marks_all_nan_samples(self):
++        samples = _samples(4)
++        rewards = [float("nan"), 0.5, float("nan"), 1.0]
++        apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert samples[0].remove_sample is True
++        assert samples[2].remove_sample is True
++        assert samples[1].remove_sample is False
++        assert samples[3].remove_sample is False
++
++    def test_no_nan_leaves_remove_sample_false(self):
++        samples = _samples(4)
++        rewards = [1.0, 0.0, 1.0, 0.5]
++        apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert all(s.remove_sample is False for s in samples)
++
++
++# ---------------------------------------------------------------------------
++# Group-local fill behavior
++# ---------------------------------------------------------------------------
++
++
++class TestGroupLocalFill:
++    def test_fill_uses_group_mean_not_batch_mean(self):
++        """Two groups of 4. Group 1: [1,1,1,NaN] → fill should be 1.0
++        (group-1 mean). If we used batch mean we'd get ≈0.43 which would
++        bias Group 1's group_mean post-normalization."""
++        samples = _samples(8)
++        rewards = [1.0, 1.0, 1.0, float("nan"),
++                   0.0, 0.0, 0.0, 0.0]
++        out = apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert out[3] == 1.0, (
++            f"NaN should be filled with group-1 mean (1.0), got {out[3]}"
++        )
++        # All other values unchanged.
++        assert out[:3] == [1.0, 1.0, 1.0]
++        assert out[4:] == [0.0, 0.0, 0.0, 0.0]
++
++    def test_fill_zero_when_entire_group_is_nan(self):
++        samples = _samples(4)
++        rewards = [float("nan")] * 4
++        out = apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert out == [0.0, 0.0, 0.0, 0.0]
++        assert all(s.remove_sample for s in samples)
++
++    def test_fill_does_not_leak_nan(self):
++        """After fill, no NaN should remain — otherwise torch.tensor()
++        downstream would produce NaN advantages and poison policy loss."""
++        samples = _samples(4)
++        rewards = [1.0, float("nan"), float("nan"), 0.5]
++        out = apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert count_nan_samples(out) == 0, f"Leaked NaN: {out}"
++
++    def test_fill_mutates_in_place(self):
++        """Both the samples list AND raw_rewards list are mutated in place.
++        Callers may rely on this. Verify by comparing identity."""
++        samples = _samples(4)
++        rewards = [1.0, float("nan"), 0.0, 1.0]
++        returned = apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert returned is rewards, "Should return the same list object"
++        assert not math.isnan(rewards[1]), "Original list should be mutated"
++
++    def test_no_nan_is_fast_noop(self):
++        """The common path (no NaN) should not mutate anything."""
++        samples = _samples(4)
++        original_rewards = [1.0, 0.0, 1.0, 0.5]
++        rewards = list(original_rewards)
++        apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        assert rewards == original_rewards
++        assert all(not s.remove_sample for s in samples)
++
++
++# ---------------------------------------------------------------------------
++# Variable group size fallback
++# ---------------------------------------------------------------------------
++
++
++class TestVariableGroupFallback:
++    def test_non_multiple_group_size_falls_back_to_batch_mean(self):
++        """If total % n_samples_per_prompt != 0, we can't cleanly group —
++        use batch-wide mean fill. Still safe because remove_sample zeros
++        the loss."""
++        samples = _samples(5)  # 5 is not a multiple of 4
++        rewards = [1.0, 1.0, float("nan"), 0.0, 0.0]
++        out = apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        # Batch mean of valid = (1+1+0+0)/4 = 0.5
++        assert out[2] == 0.5
++        assert samples[2].remove_sample is True
++
++    def test_zero_group_size_falls_back_to_batch_mean(self):
++        samples = _samples(3)
++        rewards = [1.0, float("nan"), 0.0]
++        out = apply_nan_mask(samples, rewards, n_samples_per_prompt=0)
++        # Batch mean of valid = (1+0)/2 = 0.5
++        assert out[1] == 0.5
++
++
++# ---------------------------------------------------------------------------
++# Group normalization integrity — the end-to-end math check
++# ---------------------------------------------------------------------------
++
++
++class TestGroupNormalizationIntegrity:
++    """Verify that after NaN masking + group-norm (done by the caller), the
++    filled sample contributes zero advantage and the valid peers' advantages
++    are unaffected by the NaN peer."""
++
++    def _group_normalize(self, rewards: List[float], n: int) -> List[float]:
++        """Mimic slime's group-norm: subtract group mean."""
++        out = []
++        for start in range(0, len(rewards), n):
++            group = rewards[start:start + n]
++            m = sum(group) / len(group)
++            out.extend(r - m for r in group)
++        return out
++
++    def test_filled_sample_has_zero_advantage(self):
++        samples = _samples(4)
++        rewards = [1.0, 0.0, 1.0, float("nan")]
++        apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++        # After fill: [1, 0, 1, 2/3]. Group mean = (1+0+1+2/3)/4 = 2/3.
++        # Advantage for index 3 = 2/3 - 2/3 = 0.
++        adv = self._group_normalize(rewards, n=4)
++        assert abs(adv[3]) < 1e-9, f"Filled sample advantage should be 0, got {adv[3]}"
++
++    def test_valid_peers_match_no_nan_case(self):
++        """Two groups identical except one has NaN, the other has pre-filled
++        group mean. Valid peers' advantages must be equal."""
++        # Case A: one NaN
++        samples_a = _samples(4)
++        rewards_a = [1.0, 0.0, 1.0, float("nan")]
++        apply_nan_mask(samples_a, rewards_a, n_samples_per_prompt=4)
++        adv_a = self._group_normalize(rewards_a, n=4)
++
++        # Case B: NaN already replaced with group mean (2/3) of the non-NaN values
++        samples_b = _samples(4)
++        rewards_b = [1.0, 0.0, 1.0, 2.0 / 3]
++        apply_nan_mask(samples_b, rewards_b, n_samples_per_prompt=4)
++        adv_b = self._group_normalize(rewards_b, n=4)
++
++        for i in range(4):
++            assert abs(adv_a[i] - adv_b[i]) < 1e-9, (
++                f"Advantage drift at sample {i}: {adv_a[i]} vs {adv_b[i]}"
++            )
++
++    def test_two_groups_independent(self):
++        """NaN in group 1 should not affect group 0's advantages at all."""
++        samples = _samples(8)
++        rewards = [1.0, 0.0, 1.0, 0.0,  # group 0, valid
++                   2.0, float("nan"), 2.0, 2.0]  # group 1, one NaN
++        apply_nan_mask(samples, rewards, n_samples_per_prompt=4)
++
++        # Group 0 fill unchanged: [1, 0, 1, 0], mean = 0.5, advantages = [0.5,-0.5,0.5,-0.5]
++        adv = self._group_normalize(rewards, n=4)
++        assert adv[:4] == pytest.approx([0.5, -0.5, 0.5, -0.5])
++        # Group 1: fill = 2.0 (mean of 2,2,2), all rewards = 2.0, advantages all 0.
++        assert all(abs(a) < 1e-9 for a in adv[4:])
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++
++class TestCountNanSamples:
++    def test_counts_nan(self):
++        assert count_nan_samples([1.0, float("nan"), 0.0, float("nan")]) == 2
++
++    def test_zero_when_no_nan(self):
++        assert count_nan_samples([1.0, 0.0, 0.5]) == 0
++
++    def test_ignores_non_float(self):
++        # Ints, strings, None should not be counted as NaN.
++        assert count_nan_samples([1, "x", None]) == 0

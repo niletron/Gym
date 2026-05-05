@@ -199,6 +199,21 @@ class MCQAResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
+
+        @app.get("/health")
+        async def health():
+            """End-to-end probe. mcqa's grader is pure-Python regex on bounded
+            text so it doesn't need the subprocess pool for liveness — but
+            /docs still lies if the event loop itself is wedged, so we expose
+            a dedicated endpoint the watchdog can poll."""
+            # Minimal round-trip through parse_answer_letter_strict_boxed —
+            # proves the regex engine and event loop are both responsive.
+            try:
+                pred, _, _ = _parse_answer_letter_strict_boxed("\\boxed{A}", {"A", "B"})
+                return {"status": "ok", "pred": pred}
+            except Exception as exc:
+                return {"status": "error", "error": str(exc)}
+
         return app
 
     def compute_metrics(self, tasks):

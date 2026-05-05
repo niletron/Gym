@@ -12,10 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# ---------------------------------------------------------------------------
+# structured_outputs runs untrusted JSON schemas against untrusted model
+# output through openapi_schema_validator. Pathological schemas (deep
+# recursion, patternProperties with backtracking regex) can hang the
+# validator. We isolate verify() in a subprocess pool that SIGKILLs on
+# timeout so one bad sample can't freeze the server.
+# ---------------------------------------------------------------------------
+
 import json
 import re
 from enum import StrEnum
-from typing import Any, Dict
+from typing import Any, ClassVar, Dict
 
 import xmltodict
 import yaml
@@ -28,6 +37,104 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from nemo_gym.grader_pool import GraderPool
+
+
+# ---------------------------------------------------------------------------
+# Worker-side functions — must be module-level for spawn pickle.
+# ---------------------------------------------------------------------------
+
+
+def _strictify_schema(schema: Any) -> None:
+    if isinstance(schema, dict):
+        if "properties" in schema:
+            schema["required"] = list(schema["properties"])
+            schema["additionalProperties"] = False
+        for v in schema.values():
+            _strictify_schema(v)
+
+
+def _coerce_xml_types(data: Any, schema: Dict[str, Any]) -> Any:
+    """Same behavior as the class method; duplicated here so spawn workers
+    don't need to pickle the server instance."""
+    if not isinstance(schema, dict) or "type" not in schema:
+        return data
+
+    schema_type = schema["type"]
+
+    if schema_type == "object" and isinstance(data, dict):
+        properties = schema.get("properties", {})
+        coerced = {}
+        for key, value in data.items():
+            if key in properties:
+                coerced[key] = _coerce_xml_types(value, properties[key])
+            else:
+                coerced[key] = value
+        return coerced
+
+    if schema_type == "array":
+        items_schema = schema.get("items", {})
+        if isinstance(data, dict) and len(data) == 1:
+            data = next(iter(data.values()))
+        if not isinstance(data, list):
+            data = [data] if data is not None else []
+        return [_coerce_xml_types(item, items_schema) for item in data]
+
+    if data is None and schema_type == "string":
+        return ""
+
+    if isinstance(data, str):
+        try:
+            if schema_type == "integer":
+                return int(data)
+            if schema_type == "number":
+                return float(data)
+            if schema_type == "boolean":
+                lower = data.lower()
+                if lower in ("true", "1"):
+                    return True
+                if lower in ("false", "0"):
+                    return False
+        except (ValueError, AttributeError):
+            pass
+
+    return data
+
+
+def _parse_content(schema_type: str, content: str):
+    st = schema_type.lower()
+    if st == "json":
+        return json.loads(content)
+    if st == "yaml":
+        return yaml.safe_load(content)
+    if st == "xml":
+        return xmltodict.parse(content)
+    return None
+
+
+def _evaluate_in_worker(
+    schema_type: str, schema_str: str, response_text: str, xml_coerce_types: bool
+) -> float:
+    """Runs in a worker process. Returns 0.0 on any grading failure."""
+    try:
+        schema = json.loads(schema_str)
+        _strictify_schema(schema)
+        response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+        response_text = re.sub(r"<\|[^|]*\|>", "", response_text).strip()
+        response_text = re.sub(r"^```(?:\w*)\s*\n?", "", response_text)
+        response_text = re.sub(r"\n?```\s*$", "", response_text)
+        response_obj = _parse_content(schema_type, response_text)
+        if schema_type.lower() == "xml" and xml_coerce_types:
+            response_obj = _coerce_xml_types(response_obj, schema)
+        validate_against_schema_openapi(response_obj, schema)
+        return 1.0
+    except BaseException:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
 
 
 class StructuredOutputsResourcesServerConfig(BaseResourcesServerConfig):
@@ -54,8 +161,31 @@ class StructuredOutputsVerifyResponse(BaseVerifyResponse):
 class StructuredOutputsResourcesServer(SimpleResourcesServer):
     config: StructuredOutputsResourcesServerConfig
 
+    _POOL: ClassVar[GraderPool] = GraderPool(
+        name="structured_outputs",
+        timeout_s_env="STRUCTURED_OUTPUTS_VERIFY_TIMEOUT_S",
+        workers_env="STRUCTURED_OUTPUTS_POOL_WORKERS",
+        default_timeout_s=4.0,  # routing_rm timeout is 5s
+        default_workers=4,
+    )
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        self._POOL.bind(self)
+
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
+
+        @app.get("/health")
+        async def health():
+            """End-to-end probe: grade a canned trivial JSON schema."""
+            schema_str = '{"type": "object", "properties": {"x": {"type": "integer"}}}'
+            response = '{"x": 1}'
+            result, reason = await self._POOL.run_or_zero(
+                self, _evaluate_in_worker, "json", schema_str, response, False
+            )
+            return {"status": "ok" if reason == "ok" else reason, "reward": result}
+
         return app
 
     async def verify(self, body: StructuredOutputsVerifyRequest) -> StructuredOutputsVerifyResponse:
@@ -65,126 +195,45 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         if schema_type not in list(SchemaType):
             raise NotImplementedError(f"SchemaType must be one of {list(SchemaType)}, got {schema_type} !")
 
-        # get model generation.
         assistant_responses = []
         for output_item in body.response.output:
             if output_item.type != "message":
                 continue
-
             for content_item in output_item.content:
                 if content_item.type != "output_text":
                     continue
-
                 assistant_responses.append(content_item.text)
         response_text = "".join(assistant_responses)
 
-        reward = self.evaluate_structured_output_response(schema_type, schema_str, response_text)
+        # Dispatch to subprocess pool — isolates pathological schemas or
+        # untrusted XML/YAML parsers from the event loop.
+        reward, _reason = await self._POOL.run_or_zero(
+            self,
+            _evaluate_in_worker,
+            str(schema_type.value),
+            schema_str,
+            response_text,
+            self.config.xml_coerce_types,
+        )
         return StructuredOutputsVerifyResponse(**body.model_dump(), reward=reward)
 
-    # ----- Helpers ----- #
+    # Legacy methods kept for backwards-compat with anything that imports them
+    # directly (tests, tooling).
     def parse_content(self, schema_type: SchemaType, content: str):
-        match schema_type.lower():
-            case SchemaType.JSON:
-                parsed = json.loads(content)
-            case SchemaType.YAML:
-                parsed = yaml.safe_load(content)
-            case SchemaType.XML:
-                parsed = xmltodict.parse(content)
-            case _:
-                parsed = None
-        return parsed
+        return _parse_content(str(schema_type.value), content)
 
     def strictify_schema(self, schema: Dict[str, Any]):
-        """Make a schema strict as per OpenAPI guidelines"""
-        if isinstance(schema, Dict):
-            if "properties" in schema:
-                schema["required"] = list(schema["properties"])
-                schema["additionalProperties"] = False
-            for k, v in schema.items():
-                self.strictify_schema(v)
+        _strictify_schema(schema)
 
     def coerce_xml_types(self, data: Any, schema: Dict[str, Any]) -> Any:
-        """Recursively coerce xmltodict string values to match the JSON schema types.
-
-        xmltodict.parse() returns all leaf values as strings. This method walks the
-        parsed data alongside the schema and converts values where possible.
-        On conversion failure the original value is returned so that schema
-        validation can report the error.
-        """
-        if not isinstance(schema, dict) or "type" not in schema:
-            return data
-
-        schema_type = schema["type"]
-
-        if schema_type == "object" and isinstance(data, dict):
-            properties = schema.get("properties", {})
-            coerced = {}
-            for key, value in data.items():
-                if key in properties:
-                    coerced[key] = self.coerce_xml_types(value, properties[key])
-                else:
-                    coerced[key] = value
-            return coerced
-
-        if schema_type == "array":
-            items_schema = schema.get("items", {})
-            # xmltodict represents repeated child elements as {"tagName": [values]},
-            # e.g. <skills><string>a</string><string>b</string></skills> becomes
-            # {"string": ["a", "b"]}. For single elements, xmltodict gives
-            # {"string": "python"} instead of a list. In both cases, unwrap the
-            # single-key dict since we're at an array schema position -- a dict here
-            # is always the xmltodict wrapping artifact, not a meaningful structure.
-            if isinstance(data, dict) and len(data) == 1:
-                data = next(iter(data.values()))
-            if not isinstance(data, list):
-                data = [data] if data is not None else []
-            return [self.coerce_xml_types(item, items_schema) for item in data]
-
-        # xmltodict returns None for empty tags like <field/> or <field></field>.
-        # Coerce to "" only for string types (parity with JSON/YAML where "" is valid).
-        # Non-string types (integer, boolean, etc.) intentionally left as None so
-        # they fail validation -- 0 and False are meaningful values, not "empty".
-        if data is None and schema_type == "string":
-            return ""
-
-        if isinstance(data, str):
-            try:
-                if schema_type == "integer":
-                    return int(data)
-                if schema_type == "number":
-                    return float(data)
-                if schema_type == "boolean":
-                    lower = data.lower()
-                    if lower in ("true", "1"):
-                        return True
-                    if lower in ("false", "0"):
-                        return False
-            except (ValueError, AttributeError):
-                pass
-
-        return data
+        return _coerce_xml_types(data, schema)
 
     def evaluate_structured_output_response(
         self, schema_type: SchemaType, schema_str: str, response_text: str
-    ) -> bool:
-        try:
-            schema = json.loads(schema_str)
-            self.strictify_schema(schema)
-            # Strip <think>...</think> tags (thinking models emit these before content)
-            response_text = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
-            # Strip chat template tokens (e.g. <|im_end|>, <|im_start|>, <|endoftext|>)
-            # vLLM/SGLang may append these during generation, causing JSON parse failures
-            response_text = re.sub(r"<\|[^|]*\|>", "", response_text).strip()
-            # Strip markdown code fences (e.g. ```json ... ```)
-            response_text = re.sub(r"^```(?:\w*)\s*\n?", "", response_text)
-            response_text = re.sub(r"\n?```\s*$", "", response_text)
-            response_obj = self.parse_content(schema_type, response_text)
-            if schema_type == SchemaType.XML and self.config.xml_coerce_types:
-                response_obj = self.coerce_xml_types(response_obj, schema)
-            validate_against_schema_openapi(response_obj, schema)
-            return 1.0
-        except Exception:
-            return 0.0
+    ) -> float:
+        return _evaluate_in_worker(
+            str(schema_type.value), schema_str, response_text, self.config.xml_coerce_types
+        )
 
 
 if __name__ == "__main__":

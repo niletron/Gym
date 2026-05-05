@@ -100,6 +100,28 @@ class CompCodingResourcesServer(SimpleResourcesServer):
     def model_post_init(self, context):
         self._semaphore: Semaphore = Semaphore(value=self.config.num_processes)
 
+    def setup_webserver(self):
+        app = super().setup_webserver()
+
+        @app.get("/health")
+        async def health():
+            """End-to-end liveness probe. code_gen already runs each test case
+            in a subprocess with a hard timeout, so the main risk isn't a
+            wedged verify — it's the event loop being blocked by another
+            issue. /health confirms the event loop and semaphore acquire
+            path are both responsive."""
+            import asyncio as _asyncio
+            try:
+                # Try to acquire the semaphore briefly — if the loop is wedged,
+                # this wait_for will time out.
+                async with _asyncio.timeout(2.0):
+                    async with self._semaphore:
+                        return {"status": "ok"}
+            except Exception as exc:
+                return {"status": "error", "error": str(exc)}
+
+        return app
+
     @staticmethod
     def _has_reasoning_format_violation(response) -> bool:
         open_tag = "<think>"

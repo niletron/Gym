@@ -237,8 +237,18 @@ Example output: "My final verdict is different [[A!=B]]"."""
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
 
-        # Additional server routes go here! e.g.:
-        # app.post("/get_weather")(self.get_weather)
+        @app.get("/health")
+        async def health():
+            """End-to-end probe: grade a canned "1==1" through the pool.
+
+            Watchdog polls this. /docs responds even when the verify pool is
+            wedged — only /health exercises the pool boundary and catches a
+            hung sympy worker."""
+            try:
+                reward, _ = await self._verify_answer_with_library("1", "\\boxed{1}")
+                return {"status": "ok", "reward": float(reward)}
+            except Exception as exc:
+                return {"status": "error", "error": str(exc)}
 
         return app
 
