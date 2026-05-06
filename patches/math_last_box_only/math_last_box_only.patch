@@ -1,0 +1,372 @@
+diff --git a/resources_servers/math_with_judge/app.py b/resources_servers/math_with_judge/app.py
+index 25db8b5..f23f92e 100644
+--- a/resources_servers/math_with_judge/app.py
++++ b/resources_servers/math_with_judge/app.py
+@@ -85,6 +85,78 @@ def _strip_math_delimiters_plain(s: str) -> str:
+     return s
+ 
+ 
++def _keep_only_last_boxed(text: str) -> str:
++    r"""Strip all \boxed{...} occurrences except the LAST one.
++
++    Blocks a reward-hacking exploit where the model emits many wrong
++    boxes around a correct one to game math_verify's set-merge match.
++    The model's FINAL answer convention is the LAST \boxed{} (standard
++    math-reasoning prompts instruct "put your final answer in \boxed{...}"),
++    so we keep only that one and drop earlier ones before handing the
++    string to math_verify.
++
++    Handles nested braces correctly by counting depth. Unclosed boxes
++    (no matching closing brace) are left in place (treated as plain
++    text — math_verify won't extract them anyway).
++    """
++    if not text:
++        return text
++
++    token = "\\boxed{"
++    spans: list[tuple[int, int]] = []  # list of (start, end_exclusive) for each full \boxed{...}
++
++    i = 0
++    n = len(text)
++    while True:
++        start = text.find(token, i)
++        if start < 0:
++            break
++
++        # Scan forward from the char after the opening brace, tracking
++        # nesting depth. depth starts at 1 (for \boxed{'s own open brace).
++        j = start + len(token)
++        depth = 1
++        closed_at = -1
++        while j < n:
++            ch = text[j]
++            if ch == "\\" and j + 1 < n:
++                # Skip escaped char (covers \{, \}, \\, etc.) so that
++                # an escaped brace doesn't change our depth.
++                j += 2
++                continue
++            if ch == "{":
++                depth += 1
++            elif ch == "}":
++                depth -= 1
++                if depth == 0:
++                    closed_at = j
++                    break
++            j += 1
++
++        if closed_at < 0:
++            # Unclosed \boxed{ — bail on scanning further from inside it.
++            # Advance past the token so we don't loop forever, but do NOT
++            # record a span (we can't safely remove an unclosed box).
++            i = start + len(token)
++            continue
++
++        spans.append((start, closed_at + 1))
++        i = closed_at + 1
++
++    if len(spans) < 2:
++        return text
++
++    # Remove all spans except the last. Walk from the end backwards so
++    # earlier indices stay valid as we splice.
++    last = spans[-1]
++    result = text
++    for s, e in reversed(spans[:-1]):
++        result = result[:s] + result[e:]
++        # Note: we don't need to adjust `last` because we iterate in
++        # reverse and we never touch indices >= e on subsequent passes.
++    return result
++
++
+ def _verify_in_worker(expected_answer: str, generated_answer: str):
+     """Run math_verify grading in the current (worker) process. Returns
+     (reward, extracted_answer) or raises on failure."""
+@@ -98,6 +170,13 @@ def _verify_in_worker(expected_answer: str, generated_answer: str):
+     try:
+         stripped = _strip_math_delimiters_plain(expected_answer)
+         ground_truth_parsable = "\\boxed{" + stripped + "}"
++        # Reward-hacking mitigation: math_verify set-merges all \boxed{}
++        # occurrences in the prediction, so a model can flood wrong boxes
++        # around a correct one to game the match. Keep only the LAST box
++        # (the final-answer convention) before handing to math_verify.
++        # Opt-out via MATH_KEEP_ONLY_LAST_BOX=0 for regression testing.
++        if os.environ.get("MATH_KEEP_ONLY_LAST_BOX", "1") != "0":
++            generated_answer = _keep_only_last_boxed(generated_answer)
+         ret_score, extracted_answer = _WORKER_VERIFIER(
+             [ground_truth_parsable], [generated_answer]
+         )
+diff --git a/resources_servers/math_with_judge/tests/test_last_box_only.py b/resources_servers/math_with_judge/tests/test_last_box_only.py
+new file mode 100644
+index 0000000..7c30748
+--- /dev/null
++++ b/resources_servers/math_with_judge/tests/test_last_box_only.py
+@@ -0,0 +1,269 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Tests for the multi-box reward-hacking mitigation.
++
++Covers the pure helper `_keep_only_last_boxed` and its integration via
++`_verify_in_worker` (same worker-side call path the subprocess pool uses,
++but run inline in the pytest process for speed and determinism).
++"""
++import os
++
++import pytest
++
++from resources_servers.math_with_judge.app import (
++    _keep_only_last_boxed,
++    _verify_in_worker,
++)
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Unit tests on the pure helper
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestKeepOnlyLastBoxed:
++    def test_empty_string(self):
++        assert _keep_only_last_boxed("") == ""
++
++    def test_no_boxes(self):
++        s = "just some text with no boxes at all"
++        assert _keep_only_last_boxed(s) == s
++
++    def test_single_box(self):
++        s = r"the answer is \boxed{42}"
++        assert _keep_only_last_boxed(s) == s
++
++    def test_single_box_nested_braces(self):
++        s = r"the answer is \boxed{\frac{1}{2}}"
++        assert _keep_only_last_boxed(s) == s
++
++    def test_two_boxes_simple(self):
++        s = r"stuff \boxed{1} more \boxed{2}"
++        out = _keep_only_last_boxed(s)
++        # Earlier box removed, last one kept, surrounding text preserved.
++        assert r"\boxed{1}" not in out
++        assert r"\boxed{2}" in out
++        assert out.count(r"\boxed{") == 1
++        assert "stuff" in out
++        assert "more" in out
++
++    def test_nested_braces_keeps_last_intact(self):
++        """Regression test: naive regex would truncate \boxed{\frac{1}{2}}
++        at the first '}' and leave a dangling '}'. The depth scan must
++        preserve the full expression."""
++        s = r"\boxed{1} \boxed{\frac{1}{2}}"
++        out = _keep_only_last_boxed(s)
++        assert r"\boxed{\frac{1}{2}}" in out
++        assert r"\boxed{1}" not in out
++        # Exactly one \boxed remains.
++        assert out.count(r"\boxed{") == 1
++
++    def test_many_boxes_only_last_kept(self):
++        s = r"\boxed{a}\boxed{b}\boxed{c}\boxed{d}"
++        out = _keep_only_last_boxed(s)
++        assert out.count(r"\boxed{") == 1
++        assert r"\boxed{d}" in out
++        for lost in ("a", "b", "c"):
++            assert f"\\boxed{{{lost}}}" not in out
++
++    def test_unclosed_box_dropped_silently(self):
++        r"""Unclosed \boxed{ can't be safely stripped (no end), so we
++        leave it in place. The well-formed earlier box still gets
++        stripped because we only found one complete span — but that
++        single span means len(spans) == 1, so we return unchanged.
++
++        Concretely: input "\boxed{1} \boxed{unclosed" has exactly one
++        complete box (\boxed{1}) and one unclosed fragment. The helper
++        keeps both (returns unchanged) because after the depth scan
++        we only have 1 full span. This is the "graceful" choice — we
++        never accidentally truncate text that contains unbalanced braces.
++        """
++        s = r"\boxed{1} \boxed{unclosed"
++        out = _keep_only_last_boxed(s)
++        # Not crashed. Exactly the input returned (single closed span).
++        assert out == s
++
++    def test_multiline_box(self):
++        s = "\\boxed{1}\n\n\\boxed{multi\nline\nanswer}"
++        out = _keep_only_last_boxed(s)
++        assert r"\boxed{1}" not in out
++        assert "\\boxed{multi\nline\nanswer}" in out
++        assert out.count(r"\boxed{") == 1
++
++    def test_deeply_nested(self):
++        s = r"\boxed{1} \boxed{\frac{\sqrt{a+b}}{c^{2}}}"
++        out = _keep_only_last_boxed(s)
++        assert r"\boxed{\frac{\sqrt{a+b}}{c^{2}}}" in out
++        assert r"\boxed{1}" not in out
++
++    def test_surrounding_text_preserved(self):
++        s = "Let me think. \\boxed{wrong} Hmm actually \\boxed{42}."
++        out = _keep_only_last_boxed(s)
++        assert r"\boxed{wrong}" not in out
++        assert r"\boxed{42}" in out
++        assert "Let me think." in out
++        assert "Hmm actually" in out
++        # Final period outside the box preserved.
++        assert out.endswith(".")
++
++    def test_three_boxes_middle_stripped_too(self):
++        s = r"\boxed{1} and \boxed{2} finally \boxed{3}"
++        out = _keep_only_last_boxed(s)
++        assert out.count(r"\boxed{") == 1
++        assert r"\boxed{3}" in out
++
++    def test_escaped_brace_inside_box(self):
++        r"""Escaped braces (\{, \}) shouldn't confuse the depth counter."""
++        s = r"\boxed{a \{ b \} c} \boxed{final}"
++        out = _keep_only_last_boxed(s)
++        # First box (with escaped braces) stripped; last kept.
++        assert r"\boxed{final}" in out
++        assert r"\boxed{a \{ b \} c}" not in out
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Integration tests via _verify_in_worker
++# ──────────────────────────────────────────────────────────────────────
++
++
++@pytest.fixture(autouse=True)
++def _ensure_flag_on(monkeypatch):
++    """Make sure the patch is active by default for these tests
++    (independent of the caller's environment)."""
++    monkeypatch.delenv("MATH_KEEP_ONLY_LAST_BOX", raising=False)
++    yield
++
++
++class TestVerifyInWorkerLastBoxOnly:
++    def test_single_box_correct(self):
++        reward, _extracted = _verify_in_worker("42", r"The answer is \boxed{42}.")
++        assert reward == 1.0
++
++    def test_single_box_wrong(self):
++        reward, _extracted = _verify_in_worker("42", r"The answer is \boxed{7}.")
++        assert reward == 0.0
++
++    def test_multi_box_correct_last_wrong_earlier(self):
++        """Legitimate case — the model worked through wrong guesses,
++        settled on the correct final boxed answer. Must still reward."""
++        resp = r"Try \boxed{1}. No wait, \boxed{7}. Actually: \boxed{42}."
++        reward, _ = _verify_in_worker("42", resp)
++        assert reward == 1.0
++
++    def test_multi_box_wrong_last_correct_earlier_EXPLOIT_BLOCKED(self):
++        """THE EXPLOIT: correct answer shows up earlier, wrong one last.
++        With the old set-merge behavior this would match on the correct
++        extraction and reward=1.0. With the fix, only the LAST box is
++        considered — so reward MUST be 0.0."""
++        resp = r"I think \boxed{42}. Actually, \boxed{7}."
++        reward, _ = _verify_in_worker("42", resp)
++        assert reward == 0.0
++
++    def test_flooded_boxes_correct_last(self):
++        resp = (
++            r"\boxed{1} \boxed{2} \boxed{3} \boxed{4} \boxed{5} "
++            r"\boxed{6} \boxed{7} \boxed{8} \boxed{9} \boxed{42}"
++        )
++        reward, _ = _verify_in_worker("42", resp)
++        assert reward == 1.0
++
++    def test_flooded_boxes_correct_only_first(self):
++        resp = (
++            r"\boxed{42} \boxed{2} \boxed{3} \boxed{4} \boxed{5} "
++            r"\boxed{6} \boxed{7} \boxed{8} \boxed{9} \boxed{10}"
++        )
++        reward, _ = _verify_in_worker("42", resp)
++        # Last box (\boxed{10}) is evaluated; it's wrong.
++        assert reward == 0.0
++
++    def test_nested_box_correct(self):
++        resp = r"After simplification, \boxed{\frac{1}{2}}."
++        reward, _ = _verify_in_worker(r"\frac{1}{2}", resp)
++        assert reward == 1.0
++
++    def test_nested_box_exploit_blocked(self):
++        """Multi-box with nested content in last box; previous contains
++        the correct answer. Must return 0."""
++        resp = r"\boxed{\frac{1}{2}} and then \boxed{\frac{3}{4}}."
++        reward, _ = _verify_in_worker(r"\frac{1}{2}", resp)
++        assert reward == 0.0
++
++
++class TestFeatureFlagOptOut:
++    """The flag must truly gate the preprocessing, so ops can A/B test or
++    roll back without a code change. We verify by inspecting what gets
++    handed to math_verify: with flag=0, the full multi-box string passes
++    through untouched; with flag=1/unset, only the last box survives."""
++
++    def test_flag_zero_disables_preprocessing(self, monkeypatch):
++        """With MATH_KEEP_ONLY_LAST_BOX=0, the helper is not called —
++        the second extracted prediction string should show the set-merge
++        of all boxes (e.g. '1,2,42'), confirming all boxes reached
++        math_verify unmodified."""
++        monkeypatch.setenv("MATH_KEEP_ONLY_LAST_BOX", "0")
++        resp = r"\boxed{1} \boxed{2} \boxed{42}"
++        reward, extracted = _verify_in_worker("99", resp)
++        # Gold is 99, none match — reward=0 either way. What matters is
++        # that extracted contains evidence of ALL three boxes having been
++        # parsed (set-merge by math_verify).
++        assert reward == 0.0
++        # math_verify returns the string form; with all three boxes
++        # present it contains "1", "2", and "42".
++        assert extracted is not None
++        for digit in ("1", "2", "42"):
++            assert digit in extracted, (
++                f"Expected {digit!r} in extracted={extracted!r}; flag=0 should "
++                f"pass all boxes to math_verify"
++            )
++
++    def test_flag_one_enables_preprocessing(self, monkeypatch):
++        """With the flag on (explicitly '1'), only the last box is passed
++        through. The extracted prediction must reflect only the final
++        box's content, not a set-merge of all boxes."""
++        monkeypatch.setenv("MATH_KEEP_ONLY_LAST_BOX", "1")
++        resp = r"\boxed{1} \boxed{2} \boxed{42}"
++        reward, extracted = _verify_in_worker("99", resp)
++        assert reward == 0.0
++        # Earlier boxes should NOT show up in extracted: the helper
++        # stripped them, so math_verify only saw \boxed{42}.
++        assert extracted is not None
++        assert "1" not in extracted or extracted == "42"
++        assert "2" not in extracted or extracted == "42"
++        assert "42" in extracted
++
++    def test_flag_unset_defaults_to_on(self, monkeypatch):
++        """No env var set → the fix is on (opt-out, not opt-in)."""
++        monkeypatch.delenv("MATH_KEEP_ONLY_LAST_BOX", raising=False)
++        resp = r"\boxed{1} \boxed{2} \boxed{42}"
++        _reward, extracted = _verify_in_worker("42", resp)
++        # With the fix on, only \boxed{42} reaches math_verify → extracted == "42".
++        assert extracted == "42"
++
++
++# ──────────────────────────────────────────────────────────────────────
++# Direct assertion that preprocessing is idempotent
++# ──────────────────────────────────────────────────────────────────────
++
++
++class TestIdempotence:
++    def test_applying_twice_equals_once(self):
++        s = r"\boxed{1} \boxed{2} \boxed{\frac{1}{2}}"
++        once = _keep_only_last_boxed(s)
++        twice = _keep_only_last_boxed(once)
++        assert once == twice
++
++    def test_idempotent_on_clean_input(self):
++        s = r"Just one: \boxed{x^2 + 1}"
++        assert _keep_only_last_boxed(_keep_only_last_boxed(s)) == s

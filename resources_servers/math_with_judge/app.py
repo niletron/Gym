@@ -85,6 +85,78 @@ def _strip_math_delimiters_plain(s: str) -> str:
     return s
 
 
+def _keep_only_last_boxed(text: str) -> str:
+    r"""Strip all \boxed{...} occurrences except the LAST one.
+
+    Blocks a reward-hacking exploit where the model emits many wrong
+    boxes around a correct one to game math_verify's set-merge match.
+    The model's FINAL answer convention is the LAST \boxed{} (standard
+    math-reasoning prompts instruct "put your final answer in \boxed{...}"),
+    so we keep only that one and drop earlier ones before handing the
+    string to math_verify.
+
+    Handles nested braces correctly by counting depth. Unclosed boxes
+    (no matching closing brace) are left in place (treated as plain
+    text — math_verify won't extract them anyway).
+    """
+    if not text:
+        return text
+
+    token = "\\boxed{"
+    spans: list[tuple[int, int]] = []  # list of (start, end_exclusive) for each full \boxed{...}
+
+    i = 0
+    n = len(text)
+    while True:
+        start = text.find(token, i)
+        if start < 0:
+            break
+
+        # Scan forward from the char after the opening brace, tracking
+        # nesting depth. depth starts at 1 (for \boxed{'s own open brace).
+        j = start + len(token)
+        depth = 1
+        closed_at = -1
+        while j < n:
+            ch = text[j]
+            if ch == "\\" and j + 1 < n:
+                # Skip escaped char (covers \{, \}, \\, etc.) so that
+                # an escaped brace doesn't change our depth.
+                j += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    closed_at = j
+                    break
+            j += 1
+
+        if closed_at < 0:
+            # Unclosed \boxed{ — bail on scanning further from inside it.
+            # Advance past the token so we don't loop forever, but do NOT
+            # record a span (we can't safely remove an unclosed box).
+            i = start + len(token)
+            continue
+
+        spans.append((start, closed_at + 1))
+        i = closed_at + 1
+
+    if len(spans) < 2:
+        return text
+
+    # Remove all spans except the last. Walk from the end backwards so
+    # earlier indices stay valid as we splice.
+    last = spans[-1]
+    result = text
+    for s, e in reversed(spans[:-1]):
+        result = result[:s] + result[e:]
+        # Note: we don't need to adjust `last` because we iterate in
+        # reverse and we never touch indices >= e on subsequent passes.
+    return result
+
+
 def _verify_in_worker(expected_answer: str, generated_answer: str):
     """Run math_verify grading in the current (worker) process. Returns
     (reward, extracted_answer) or raises on failure."""
@@ -98,6 +170,13 @@ def _verify_in_worker(expected_answer: str, generated_answer: str):
     try:
         stripped = _strip_math_delimiters_plain(expected_answer)
         ground_truth_parsable = "\\boxed{" + stripped + "}"
+        # Reward-hacking mitigation: math_verify set-merges all \boxed{}
+        # occurrences in the prediction, so a model can flood wrong boxes
+        # around a correct one to game the match. Keep only the LAST box
+        # (the final-answer convention) before handing to math_verify.
+        # Opt-out via MATH_KEEP_ONLY_LAST_BOX=0 for regression testing.
+        if os.environ.get("MATH_KEEP_ONLY_LAST_BOX", "1") != "0":
+            generated_answer = _keep_only_last_boxed(generated_answer)
         ret_score, extracted_answer = _WORKER_VERIFIER(
             [ground_truth_parsable], [generated_answer]
         )
