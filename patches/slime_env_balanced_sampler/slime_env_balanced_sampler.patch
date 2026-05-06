@@ -1,30 +1,125 @@
 # Slime env-balanced rollout sampler patch
-# Generated: 2026-05-06
-# Purpose: balance per-env fractions in each rollout batch when --env-sampling-weights set
+# Generated: 2026-05-04 (wandb-metrics revision)
+# Purpose: balance per-env fractions in each rollout batch when --env-sampling-weights set,
+# with optional adaptive EMA-variance re-weighting (--env-sampling-adaptive), plus
+# per-env telemetry (weights / draw counts / EMAs / variance) emitted to WandB
+# under the env_sampler/* prefix so the user can watch the sampler live.
 #
 # Why: RLVR1_v2 dataset is IF-heavy. Bottom-reward envs (math, code_gen) get
-# proportionally less gradient signal per step because their samples are
-# under-represented. This patch adds --env-sampling-weights to force
-# per-env fractions in every rollout batch.
+# proportionally less gradient signal under GRPO/GSPO. Static weights fix the
+# distribution; adaptive mode re-weights based on live reward feedback so
+# saturated envs (pass rate ~1) get down-sampled and the learnable middle
+# (pass rate ~0.5) gets up-sampled. The WandB metrics hook makes both modes
+# observable — every rollout emits env_sampler/weight/<env>, draw_ratio/<env>,
+# ema_reward/<env>, etc. See README.md "WandB metrics" for the full list.
 #
-# Files changed:
-#   NEW   slime/utils/env_balanced_sampling.py    stdlib-only helper (~190 lines)
-#   EDIT  slime/rollout/data_source.py            wires the sampler into RolloutDataSource
-#   EDIT  slime/utils/arguments.py                adds --env-sampling-weights + --env-sampling-metadata-key
-#   NEW   tests/test_env_balanced_sampling.py     18 unit tests
+# Apply with: git apply slime_env_balanced_sampler.patch
+# NOTE: the rollout.py hunk assumes the NaN-mask patch (nan_masking.py) has
+# been applied first. Apply order on a pod: nan_masking -> env_balanced_sampler.
 #
-# Apply:
-#     cd /root/slime    # or wherever slime is
-#     git apply --check /tmp/slime_env_balanced_sampler.patch
-#     git apply        /tmp/slime_env_balanced_sampler.patch
-# Roll back:
-#     git apply --reverse /tmp/slime_env_balanced_sampler.patch
-#
+diff --git a/slime/ray/rollout.py b/slime/ray/rollout.py
+index 8f266ab0..89958968 100644
+--- a/slime/ray/rollout.py
++++ b/slime/ray/rollout.py
+@@ -301,11 +301,76 @@ class RolloutManager:
+ 
+             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+ 
++    def _feed_env_sampler_rewards(self, samples, raw_rewards):
++        """Bucket per-sample rewards by env_type and push the per-env mean
++        to the adaptive env sampler (if one is active).
++
++        No-op when there is no sampler, when the sampler is in static mode,
++        or when no sample carries an env_type metadata tag. Robust to
++        sample.metadata being None or missing.
++        """
++        sampler = getattr(getattr(self, "data_source", None), "_env_sampler", None)
++        if sampler is None:
++            # Fallback path: check the module-level registry. This covers
++            # setups where data_source isn't accessible from here.
++            try:
++                from slime.utils.env_balanced_sampling import get_active_sampler
++                sampler = get_active_sampler()
++            except Exception:
++                sampler = None
++        if sampler is None or not getattr(sampler, "adaptive", False):
++            return
++
++        metadata_key = getattr(sampler, "_metadata_key", "env_type")
++        per_env_sum: dict[str, float] = {}
++        per_env_count: dict[str, int] = {}
++        for sample, reward in zip(samples, raw_rewards):
++            md = getattr(sample, "metadata", None)
++            env = None
++            if isinstance(md, dict):
++                env = md.get(metadata_key)
++            if env is None:
++                continue
++            try:
++                r = float(reward)
++            except (TypeError, ValueError):
++                continue
++            # Skip NaN (masked) rewards — they're not meaningful signal.
++            if r != r:
++                continue
++            per_env_sum[env] = per_env_sum.get(env, 0.0) + r
++            per_env_count[env] = per_env_count.get(env, 0) + 1
++
++        if not per_env_count:
++            return
++        env_rewards = {env: per_env_sum[env] / per_env_count[env] for env in per_env_count}
++        rollout_id = int(getattr(self, "rollout_id", 0) or 0)
++        sampler.update_rewards(env_rewards, rollout_id=rollout_id)
++
+     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
+         if self.custom_reward_post_process_func is not None:
+             return self.custom_reward_post_process_func(self.args, samples)
+ 
+         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
++
++        # NaN-as-mask: if the custom_rm returned float('nan') for a sample
++        # (grader timeout / HTTP error / wedged pool), mark the sample with
++        # remove_sample=True and replace NaN with the group-local mean so
++        # group normalization stays clean. See slime/utils/nan_masking.py
++        # for the contract; see slime_integration/routing_rm.py for the
++        # NaN-emitting side.
++        from slime.utils.nan_masking import apply_nan_mask
++        raw_rewards = apply_nan_mask(samples, raw_rewards, self.args.n_samples_per_prompt)
++
++        # Adaptive env-sampling feedback: bucket rewards by env_type and
++        # push per-env means to the active EnvBalancedSampler. No-op when
++        # adaptive mode is off, or when no sampler is active. Guarded in a
++        # try/except so an instrumentation bug can't crash the rollout.
++        try:
++            self._feed_env_sampler_rewards(samples, raw_rewards)
++        except Exception:
++            logger.exception("env_balanced_sampler feedback hook failed; continuing")
++
+         if (
+             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+             and self.args.rewards_normalization
+@@ -732,6 +797,16 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
+     log_dict = {**(rollout_extra_metrics or {})}
+     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
+     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
++    # Env-balanced sampler telemetry (no-op when no sampler is active).
++    # Merges keys prefixed with "env_sampler/..." so they group in WandB.
++    # Guarded so an instrumentation bug can't crash the rollout.
++    try:
++        from slime.utils.env_balanced_sampling import get_active_sampler
++        sampler = get_active_sampler()
++        if sampler is not None:
++            log_dict |= sampler.get_metrics()
++    except Exception:
++        logger.exception("env_balanced_sampler metrics hook failed; continuing")
+     logger.info(f"perf {rollout_id}: {log_dict}")
+     step = compute_rollout_step(args, rollout_id)
+     log_dict["rollout/step"] = step
 diff --git a/slime/rollout/data_source.py b/slime/rollout/data_source.py
-index e52cd27e..a79478bf 100644
+index e52cd27e..72ac23bb 100644
 --- a/slime/rollout/data_source.py
 +++ b/slime/rollout/data_source.py
-@@ -84,13 +84,37 @@ class RolloutDataSource(DataSource):
+@@ -84,13 +84,43 @@ class RolloutDataSource(DataSource):
              )
              if self.args.rollout_shuffle:
                  self.dataset.shuffle(self.epoch_id)
@@ -41,6 +136,12 @@ index e52cd27e..a79478bf 100644
 +                    weights=self.args.env_sampling_weights,
 +                    seed=self.args.rollout_seed,
 +                    metadata_key=getattr(self.args, "env_sampling_metadata_key", "env_type"),
++                    adaptive=getattr(self.args, "env_sampling_adaptive", False),
++                    ema_alpha=getattr(self.args, "env_sampling_ema_alpha", 0.9),
++                    refresh_interval=getattr(self.args, "env_sampling_refresh_interval", 10),
++                    weight_floor=getattr(self.args, "env_sampling_weight_floor", 0.02),
++                    weight_ceiling=getattr(self.args, "env_sampling_weight_ceiling", 0.40),
++                    warmup=getattr(self.args, "env_sampling_warmup", 5),
 +                )
          else:
              self.dataset = None
@@ -64,10 +165,10 @@ index e52cd27e..a79478bf 100644
                  self.sample_offset += num_samples
              else:
 diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
-index 8932dbd5..5f874f17 100644
+index 8932dbd5..005ecd4d 100644
 --- a/slime/utils/arguments.py
 +++ b/slime/utils/arguments.py
-@@ -339,6 +339,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+@@ -339,6 +339,89 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                      "This is used to shuffle the prompts and also for the random sampling of the prompts."
                  ),
              )
@@ -95,15 +196,74 @@ index 8932dbd5..5f874f17 100644
 +                    "env-balanced sampling. Default: env_type."
 +                ),
 +            )
++            parser.add_argument(
++                "--env-sampling-adaptive",
++                action="store_true",
++                default=False,
++                help=(
++                    "Enable adaptive EMA-variance re-weighting of env sampling weights. "
++                    "Under this mode, the user-provided --env-sampling-weights are treated "
++                    "as INITIAL weights used during warmup; after warmup, weights are "
++                    "re-derived from per-env reward EMAs so saturated envs (pass rate ~1) "
++                    "are down-sampled and learnable-middle envs (pass rate ~0.5) are "
++                    "up-sampled. Strictly opt-in; default is static mode."
++                ),
++            )
++            parser.add_argument(
++                "--env-sampling-ema-alpha",
++                type=float,
++                default=0.9,
++                help=(
++                    "Smoothing factor for per-env reward EMA used by adaptive env "
++                    "sampling. Higher = smoother / slower reaction. Default: 0.9."
++                ),
++            )
++            parser.add_argument(
++                "--env-sampling-refresh-interval",
++                type=int,
++                default=10,
++                help=(
++                    "Number of rollouts between adaptive re-weight recomputations. "
++                    "Default: 10. Smaller = more reactive but noisier."
++                ),
++            )
++            parser.add_argument(
++                "--env-sampling-weight-floor",
++                type=float,
++                default=0.02,
++                help=(
++                    "Minimum fraction any env can be clamped to under adaptive re-weighting. "
++                    "Prevents starvation of saturated envs. Default: 0.02 (2%% of the batch)."
++                ),
++            )
++            parser.add_argument(
++                "--env-sampling-weight-ceiling",
++                type=float,
++                default=0.40,
++                help=(
++                    "Maximum fraction any env can be clamped to under adaptive re-weighting. "
++                    "Prevents monopoly by a single high-variance env. Default: 0.40."
++                ),
++            )
++            parser.add_argument(
++                "--env-sampling-warmup",
++                type=int,
++                default=5,
++                help=(
++                    "Number of rollouts of static (user-provided) weight behavior before "
++                    "adaptive re-weighting takes effect. Gives EMAs time to accumulate "
++                    "signal. Default: 5."
++                ),
++            )
  
              # sampling
              parser.add_argument(
 diff --git a/slime/utils/env_balanced_sampling.py b/slime/utils/env_balanced_sampling.py
 new file mode 100644
-index 00000000..09911b6f
+index 00000000..2d579bf0
 --- /dev/null
 +++ b/slime/utils/env_balanced_sampling.py
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,612 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +# SPDX-License-Identifier: Apache-2.0
 +"""Env-balanced prompt sampling for mixed-environment RLVR runs.
@@ -126,17 +286,28 @@ index 00000000..09911b6f
 +
 +Contract:
 +
-+  * ``EnvBalancedSampler(samples, weights, seed, metadata_key)`` —
++  * ``EnvBalancedSampler(samples, weights, seed, metadata_key, adaptive=...)`` —
 +    construct from a list of Sample objects, a ``{env: fraction}`` dict
 +    (fractions should roughly sum to 1.0; the sampler normalizes), an
 +    RNG seed, and the key under ``sample.metadata`` that holds the env
-+    name.
++    name. Passing ``adaptive=True`` (plus the EMA/refresh/floor/ceiling
++    knobs) enables adaptive EMA-variance re-weighting — see below.
 +  * ``.draw(num_samples)`` — return ``num_samples`` prompts, with per-env
 +    counts determined by the largest-remainder method for exactness.
++  * ``.update_rewards({env: mean_reward}, rollout_id)`` — feedback hook.
++    No-op in static mode. In adaptive mode, updates per-env EMA; after
++    warmup + every refresh_interval rollouts, re-derives weights from
++    binary-reward variance (``p * (1-p)``), clamped to [floor, ceiling]
++    and renormalized.
 +  * Samples whose metadata does not match any configured env are placed
 +    in an "other" bucket; if the weights dict contains an entry for
 +    ``"other"`` or ``"__other__"`` they are included at that weight,
 +    otherwise they are dropped.
++
++Thread-safety: ``update_rewards`` may be called from a different Ray
++actor than ``draw``. The adaptive state (EMAs, rollout counter, live
++weights) is guarded by a ``threading.Lock``. The static per-env shuffle
++state is not cross-actor — callers must own that.
 +
 +Pure stdlib. No slime or torch imports. Unit-testable in isolation.
 +"""
@@ -145,11 +316,40 @@ index 00000000..09911b6f
 +
 +import logging
 +import random
++import threading
 +from typing import Any, Dict, List, Optional
 +
 +logger = logging.getLogger(__name__)
 +
 +_OTHER_ENV = "__other__"
++
++# Module-level registry for active samplers. The reward-feedback hook in
++# slime/ray/rollout.py can reach the sampler without needing a direct
++# reference by calling ``get_active_sampler()``. This is a soft fallback —
++# the preferred wiring is via RolloutManager.data_source._env_sampler —
++# but the registry makes the hook safe to invoke even in setups where the
++# data source isn't reachable from the manager (e.g. bespoke agents).
++_active_sampler_ref: Optional["EnvBalancedSampler"] = None
++
++
++def get_active_sampler() -> Optional["EnvBalancedSampler"]:
++    """Return the most recently constructed sampler, or None if there isn't one.
++
++    Used by the reward-feedback hook as a fallback wiring path. Callers
++    should be prepared for None (static mode / no sampler active).
++    """
++    return _active_sampler_ref
++
++
++def _register_active_sampler(sampler: "EnvBalancedSampler") -> None:
++    global _active_sampler_ref
++    _active_sampler_ref = sampler
++
++
++def _clear_active_sampler() -> None:
++    """Test-only helper to reset the module-level registry."""
++    global _active_sampler_ref
++    _active_sampler_ref = None
 +
 +
 +class EnvBalancedSampler:
@@ -159,6 +359,13 @@ index 00000000..09911b6f
 +        weights: Dict[str, float],
 +        seed: int = 42,
 +        metadata_key: str = "env_type",
++        *,
++        adaptive: bool = False,
++        ema_alpha: float = 0.9,
++        refresh_interval: int = 10,
++        weight_floor: float = 0.02,
++        weight_ceiling: float = 0.40,
++        warmup: int = 5,
 +    ):
 +        if not weights:
 +            raise ValueError("env-balanced sampler requires a non-empty weights dict")
@@ -169,9 +376,59 @@ index 00000000..09911b6f
 +        if total <= 0:
 +            raise ValueError(f"env-balanced weights must sum to a positive number, got {total}")
 +        self.weights: Dict[str, float] = {env: w / total for env, w in weights.items()}
++        # Keep the user-provided initial weights verbatim — adaptive mode uses them
++        # during warmup and falls back to them if an env has no EMA signal yet.
++        self._initial_weights: Dict[str, float] = dict(self.weights)
 +
 +        self._metadata_key = metadata_key
 +        self._rng = random.Random(seed)
++
++        # ----- adaptive-mode knobs -----
++        self.adaptive = bool(adaptive)
++        self.ema_alpha = float(ema_alpha)
++        self.refresh_interval = int(refresh_interval)
++        self.weight_floor = float(weight_floor)
++        self.weight_ceiling = float(weight_ceiling)
++        self.warmup = int(warmup)
++
++        if self.adaptive:
++            if not (0.0 <= self.ema_alpha <= 1.0):
++                raise ValueError(f"ema_alpha must be in [0,1], got {self.ema_alpha}")
++            if self.refresh_interval <= 0:
++                raise ValueError(f"refresh_interval must be > 0, got {self.refresh_interval}")
++            if not (0.0 <= self.weight_floor <= self.weight_ceiling <= 1.0):
++                raise ValueError(
++                    f"require 0 <= weight_floor ({self.weight_floor}) <= weight_ceiling "
++                    f"({self.weight_ceiling}) <= 1"
++                )
++            if self.warmup < 0:
++                raise ValueError(f"warmup must be >= 0, got {self.warmup}")
++
++        # EMA of mean reward per env, updated by update_rewards().
++        # None = no signal received yet for this env.
++        self._ema: Dict[str, Optional[float]] = {env: None for env in self.weights}
++        # How many rollouts we have observed update_rewards() for.
++        self._rollout_counter: int = 0
++        # When the last refresh recomputed weights; refresh fires when
++        # (counter - last_refresh) >= refresh_interval, after warmup.
++        self._last_refresh_counter: int = 0
++        # How many adaptive re-weight events have fired.
++        self._refreshes: int = 0
++        # Lock guarding _ema, _rollout_counter, _last_refresh_counter, and
++        # mutations to self.weights. draw() reads self.weights under the lock
++        # via _snapshot_weights() to avoid mid-update tearing. Also guards
++        # the metrics-tracking counters below.
++        self._lock = threading.Lock()
++
++        # ----- draw-tracking counters (for WandB metrics) -----
++        # _last_batch_counts: how many of each env in the most recent draw().
++        # _cumulative_counts: running total per env since init.
++        # _total_draws: number of draw() calls.
++        # _last_batch_size: size of the last draw (0 until first draw).
++        self._last_batch_counts: Dict[str, int] = {env: 0 for env in self.weights}
++        self._cumulative_counts: Dict[str, int] = {env: 0 for env in self.weights}
++        self._total_draws: int = 0
++        self._last_batch_size: int = 0
 +
 +        # Bucket samples by env_type. Samples whose metadata key is missing or
 +        # unrecognized go into __other__; they are included in draws only if
@@ -225,6 +482,11 @@ index 00000000..09911b6f
 +        for env in self.buckets:
 +            self._reshuffle(env)
 +
++        # Register in the module-level registry so slime's reward-feedback
++        # hook can reach this sampler even if it doesn't have a direct
++        # reference. See get_active_sampler().
++        _register_active_sampler(self)
++
 +    def _reshuffle(self, env: str) -> None:
 +        order = list(range(len(self.buckets[env])))
 +        self._rng.shuffle(order)
@@ -248,11 +510,22 @@ index 00000000..09911b6f
 +                self._reshuffle(env)
 +        return out
 +
-+    def _compute_targets(self, n: int) -> Dict[str, int]:
++    def _snapshot_weights(self) -> Dict[str, float]:
++        """Return a thread-safe copy of self.weights.
++
++        Called on every ``draw()`` so concurrent ``update_rewards()`` calls
++        can't tear the weights dict mid-read.
++        """
++        with self._lock:
++            return dict(self.weights)
++
++    def _compute_targets(self, n: int, weights: Optional[Dict[str, float]] = None) -> Dict[str, int]:
 +        """Distribute n into per-env integer counts summing exactly to n,
 +        using the largest-remainder method. Envs in weights order act as
 +        tie-breakers so behavior is deterministic."""
-+        raw = {env: n * w for env, w in self.weights.items()}
++        if weights is None:
++            weights = self.weights
++        raw = {env: n * w for env, w in weights.items()}
 +        floors = {env: int(v) for env, v in raw.items()}
 +        leftover = n - sum(floors.values())
 +        # Sort by (fractional part desc, env name) for determinism.
@@ -270,7 +543,10 @@ index 00000000..09911b6f
 +        matching the configured weights."""
 +        if num_samples <= 0:
 +            return []
-+        targets = self._compute_targets(num_samples)
++        # Snapshot weights once per draw so concurrent update_rewards()
++        # doesn't change the target mid-loop.
++        weights = self._snapshot_weights()
++        targets = self._compute_targets(num_samples, weights=weights)
 +        drawn: List[Any] = []
 +        for env, count in targets.items():
 +            drawn.extend(self._draw_env(env, count))
@@ -279,19 +555,289 @@ index 00000000..09911b6f
 +        # across samples in the rollout engine.
 +        if shuffle_output:
 +            self._rng.shuffle(drawn)
++
++        # Update draw-tracking counters under the lock so get_metrics() and
++        # concurrent update_rewards() see consistent state. ``targets``
++        # already reflects what _draw_env actually returned (per-env count
++        # is exact by construction of _compute_targets + _draw_env).
++        with self._lock:
++            self._last_batch_counts = {env: int(targets.get(env, 0)) for env in self.weights}
++            for env, c in self._last_batch_counts.items():
++                self._cumulative_counts[env] = self._cumulative_counts.get(env, 0) + c
++            self._total_draws += 1
++            self._last_batch_size = int(num_samples)
 +        return drawn
++
++    # ------------------------------------------------------------------
++    # Adaptive mode: reward feedback + variance-based re-weighting.
++    # ------------------------------------------------------------------
++
++    def update_rewards(self, env_rewards: Dict[str, float], rollout_id: int = 0) -> None:
++        """Feedback hook — absorb one rollout's per-env mean reward.
++
++        In static mode this is a no-op (kept as a cheap entry point so
++        callers don't need to branch on ``self.adaptive``).
++
++        In adaptive mode:
++          * updates ``ema[env] = alpha * ema[env] + (1-alpha) * reward``
++            for each env in env_rewards that is also in self.weights
++            (unknown envs are logged as warnings and skipped)
++          * increments the rollout counter
++          * if past warmup AND at least ``refresh_interval`` rollouts have
++            elapsed since the last refresh, recomputes weights from
++            variance ``p*(1-p)``, clamped to [floor, ceiling], renormalized.
++        """
++        if not self.adaptive:
++            return
++        if not isinstance(env_rewards, dict) or not env_rewards:
++            return
++
++        with self._lock:
++            # Ingest the reward signal — one EMA step per env.
++            for env, reward in env_rewards.items():
++                if env not in self._ema:
++                    logger.warning(
++                        "env_balanced_sampler.update_rewards: ignoring unknown env %r "
++                        "(not in initial weights dict; known envs: %s)",
++                        env, sorted(self._ema.keys()),
++                    )
++                    continue
++                try:
++                    r = float(reward)
++                except (TypeError, ValueError):
++                    logger.warning(
++                        "env_balanced_sampler.update_rewards: non-numeric reward %r for env %r; skipping",
++                        reward, env,
++                    )
++                    continue
++                # Clamp reward to [0,1] — the variance proxy p*(1-p) assumes
++                # a binary-reward signal. Values outside the unit interval
++                # would give negative or misleading "variance."
++                if r < 0.0:
++                    r = 0.0
++                elif r > 1.0:
++                    r = 1.0
++                prev = self._ema[env]
++                if prev is None:
++                    self._ema[env] = r
++                else:
++                    self._ema[env] = self.ema_alpha * prev + (1.0 - self.ema_alpha) * r
++
++            self._rollout_counter += 1
++
++            # Respect warmup: keep serving initial (user-provided) weights
++            # until we have warmup rollouts of EMA signal.
++            if self._rollout_counter < self.warmup:
++                return
++            if (self._rollout_counter - self._last_refresh_counter) < self.refresh_interval:
++                return
++
++            self._refresh_weights_locked()
++            self._last_refresh_counter = self._rollout_counter
++
++    @staticmethod
++    def _clamp_and_redistribute(
++        weights: Dict[str, float],
++        floor: float,
++        ceiling: float,
++    ) -> Optional[Dict[str, float]]:
++        """Project ``weights`` onto the simplex subject to per-env floor/ceiling.
++
++        Standard water-filling: repeatedly pin any env that violates a bound,
++        then rescale the unpinned envs to absorb the remaining mass. Iterates
++        to fixed point. Returns a new dict summing to 1.0, or None if no
++        feasible solution exists (which should be caught by config validation).
++        """
++        n = len(weights)
++        if n == 0:
++            return None
++        # Feasibility: floor*n <= 1 <= ceiling*n. With our defaults
++        # (floor=0.02, ceiling=0.40), this accepts up to 50 and >= 3 envs.
++        if floor * n > 1.0 + 1e-9 or ceiling * n < 1.0 - 1e-9:
++            return None
++
++        # Start with the raw weights, normalized.
++        total = sum(weights.values())
++        if total <= 0:
++            return None
++        w = {env: v / total for env, v in weights.items()}
++        pinned: Dict[str, float] = {}
++        # At most n iterations — each either pins an env or converges.
++        for _ in range(n + 1):
++            violated = [env for env, v in w.items() if v < floor - 1e-12 or v > ceiling + 1e-12]
++            if not violated:
++                out = dict(pinned)
++                out.update(w)
++                # Final defensive renormalize (should already sum to 1).
++                s = sum(out.values())
++                if s <= 0:
++                    return None
++                return {env: v / s for env, v in out.items()}
++            # Pin the most-violating env.
++            for env in violated:
++                if w[env] < floor:
++                    pinned[env] = floor
++                elif w[env] > ceiling:
++                    pinned[env] = ceiling
++                w.pop(env, None)
++            # Rescale the survivors to absorb the remaining mass.
++            remaining = 1.0 - sum(pinned.values())
++            if not w:
++                # Everything pinned — check that pinned weights sum to 1.
++                s = sum(pinned.values())
++                if abs(s - 1.0) > 1e-6 and s > 0:
++                    return {env: v / s for env, v in pinned.items()}
++                return pinned
++            if remaining <= 0:
++                # No mass left for unpinned envs — give them floor and rescale all.
++                for env in list(w.keys()):
++                    w[env] = floor
++                total_all = sum(pinned.values()) + sum(w.values())
++                if total_all <= 0:
++                    return None
++                merged = {**pinned, **w}
++                return {env: v / total_all for env, v in merged.items()}
++            scale = remaining / sum(w.values()) if sum(w.values()) > 0 else 0.0
++            w = {env: v * scale for env, v in w.items()}
++        # Didn't converge — return None so caller keeps previous weights.
++        return None
++
++    def _refresh_weights_locked(self) -> None:
++        """Recompute self.weights from current EMAs. Must be called with self._lock held."""
++        # raw_weight[env] = variance proxy = p * (1-p).
++        # If an env has no EMA signal yet, fall back to its initial weight so
++        # it doesn't get starved.
++        raw: Dict[str, float] = {}
++        for env in self.weights:
++            p = self._ema.get(env)
++            if p is None:
++                # No signal yet — preserve initial weight magnitude as a
++                # proxy. Caller's initial weights have already been normalized.
++                raw[env] = max(self._initial_weights.get(env, 0.0), 1e-9)
++            else:
++                var = p * (1.0 - p)
++                raw[env] = max(var, 1e-9)  # floor at tiny epsilon so renormalize works
++
++        total = sum(raw.values())
++        if total <= 0:
++            logger.warning(
++                "env_balanced_sampler: all variance weights collapsed to zero; "
++                "retaining previous weights"
++            )
++            return
++        new_weights = {env: v / total for env, v in raw.items()}
++
++        # Clamp to [floor, ceiling] with "water-filling" — clamp only the
++        # envs that violate the bounds, then redistribute the remaining
++        # mass proportionally to the unclamped envs. Iterate to a fixed point.
++        new_weights = self._clamp_and_redistribute(
++            new_weights, self.weight_floor, self.weight_ceiling,
++        )
++        if new_weights is None:
++            logger.warning(
++                "env_balanced_sampler: clamp+redistribute could not converge; "
++                "retaining previous weights"
++            )
++            return
++
++        logger.info(
++            "env_balanced_sampler: adaptive refresh at rollout %d — new weights: %s",
++            self._rollout_counter,
++            {env: round(w, 4) for env, w in new_weights.items()},
++        )
++        self.weights = new_weights
++        self._refreshes += 1
++
++    # ------------------------------------------------------------------
++    # WandB-facing metrics — call after each rollout, merge into the
++    # rollout's metrics dict before wandb.log(...).
++    # ------------------------------------------------------------------
++
++    def get_metrics(self) -> Dict[str, float]:
++        """Return a wandb-loggable dict of sampler state.
++
++        Keys are prefixed with ``env_sampler/`` to group in the dashboard.
++        Call after each rollout; merge into the rollout's metrics dict
++        before wandb.log().
++
++        All values are cast to ``float`` (wandb rejects ints/bools/strings
++        for scalar metrics) and all keys are flat strings — the ``/``
++        inside a key is wandb's group separator.
++        """
++        with self._lock:
++            weights_snap = dict(self.weights)
++            initial_snap = dict(self._initial_weights)
++            last_counts = dict(self._last_batch_counts)
++            cumulative = dict(self._cumulative_counts)
++            ema_snap = dict(self._ema)
++            total_draws = int(self._total_draws)
++            last_batch_size = int(self._last_batch_size)
++            rollout_counter = int(self._rollout_counter)
++            refreshes = int(self._refreshes)
++
++        metrics: Dict[str, float] = {}
++
++        # Current weights (post-adaptive). Always emitted so dashboard
++        # always has a value even when nothing has drifted.
++        for env, w in weights_snap.items():
++            metrics[f"env_sampler/weight/{env}"] = float(w)
++
++        # Initial weights (constant across the run — lets the dashboard
++        # visualize how far adaptive has drifted from the user's config).
++        for env, w in initial_snap.items():
++            metrics[f"env_sampler/initial_weight/{env}"] = float(w)
++
++        # Last-batch draw ratios + raw counts. If no draw has happened yet,
++        # both are zero for every env.
++        denom = float(last_batch_size) if last_batch_size > 0 else 0.0
++        for env in weights_snap:
++            count = int(last_counts.get(env, 0))
++            ratio = (count / denom) if denom > 0 else 0.0
++            metrics[f"env_sampler/draw_count/{env}"] = float(count)
++            metrics[f"env_sampler/draw_ratio/{env}"] = float(ratio)
++
++        # Cumulative draw ratios (lifetime fraction of samples drawn per env).
++        cum_total = float(sum(cumulative.values()))
++        for env in weights_snap:
++            c = float(cumulative.get(env, 0))
++            cum_ratio = (c / cum_total) if cum_total > 0 else 0.0
++            metrics[f"env_sampler/cumulative_ratio/{env}"] = float(cum_ratio)
++
++        # Meta counters — always emit.
++        metrics["env_sampler/total_draws"] = float(total_draws)
++        metrics["env_sampler/batch_size"] = float(last_batch_size)
++        metrics["env_sampler/adaptive"] = 1.0 if self.adaptive else 0.0
++
++        # Adaptive-only signal. In static mode we still emit them as 0.0
++        # so the dashboard doesn't go dark if someone flips modes mid-run.
++        for env in weights_snap:
++            ema = ema_snap.get(env)
++            p = float(ema) if ema is not None else 0.0
++            metrics[f"env_sampler/ema_reward/{env}"] = p
++            metrics[f"env_sampler/variance/{env}"] = float(p * (1.0 - p))
++
++        metrics["env_sampler/rollout_counter"] = float(rollout_counter)
++        metrics["env_sampler/refreshes"] = float(refreshes)
++
++        return metrics
 +
 +    # ------------------------------------------------------------------
 +    # State save/load — optional, for checkpoint resume.
 +    # ------------------------------------------------------------------
 +
 +    def state_dict(self) -> Dict[str, Any]:
-+        return {
-+            "order": dict(self._order),
-+            "offset": dict(self._offset),
-+            "rng_state": self._rng.getstate(),
-+            "weights": dict(self.weights),
-+        }
++        with self._lock:
++            return {
++                "order": dict(self._order),
++                "offset": dict(self._offset),
++                "rng_state": self._rng.getstate(),
++                "weights": dict(self.weights),
++                "initial_weights": dict(self._initial_weights),
++                "ema": dict(self._ema),
++                "rollout_counter": int(self._rollout_counter),
++                "last_refresh_counter": int(self._last_refresh_counter),
++                "adaptive": bool(self.adaptive),
++            }
 +
 +    def load_state_dict(self, state: Dict[str, Any]) -> None:
 +        # Only load state that matches the current config; if bucket sizes
@@ -308,12 +854,34 @@ index 00000000..09911b6f
 +                self._rng.setstate(rng_state)
 +            except (TypeError, ValueError):
 +                logger.warning("env_balanced_sampler: ignoring incompatible saved RNG state")
++
++        # Adaptive state. Guarded so concurrent update_rewards() can't race.
++        with self._lock:
++            saved_weights = state.get("weights")
++            if isinstance(saved_weights, dict) and set(saved_weights.keys()) == set(self.weights.keys()):
++                self.weights = {env: float(w) for env, w in saved_weights.items()}
++            saved_ema = state.get("ema")
++            if isinstance(saved_ema, dict):
++                for env in self._ema:
++                    if env in saved_ema:
++                        v = saved_ema[env]
++                        self._ema[env] = None if v is None else float(v)
++            if "rollout_counter" in state:
++                try:
++                    self._rollout_counter = int(state["rollout_counter"])
++                except (TypeError, ValueError):
++                    pass
++            if "last_refresh_counter" in state:
++                try:
++                    self._last_refresh_counter = int(state["last_refresh_counter"])
++                except (TypeError, ValueError):
++                    pass
 diff --git a/tests/test_env_balanced_sampling.py b/tests/test_env_balanced_sampling.py
 new file mode 100644
-index 00000000..2cae3683
+index 00000000..52838876
 --- /dev/null
 +++ b/tests/test_env_balanced_sampling.py
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,781 @@
 +# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +# SPDX-License-Identifier: Apache-2.0
 +"""Tests for slime/utils/env_balanced_sampling.py.
@@ -339,12 +907,17 @@ index 00000000..2cae3683
 +
 +import collections
 +import logging
++import threading
 +from types import SimpleNamespace
 +from typing import Any, Dict, List
 +
 +import pytest
 +
-+from slime.utils.env_balanced_sampling import EnvBalancedSampler
++from slime.utils.env_balanced_sampling import (
++    EnvBalancedSampler,
++    _clear_active_sampler,
++    get_active_sampler,
++)
 +
 +
 +def _make_sample(env: str, idx: int = 0) -> SimpleNamespace:
@@ -612,3 +1185,481 @@ index 00000000..2cae3683
 +        # The dominant env (instruction_following) gets 19 slots per batch —
 +        # down from its ~33% natural share.
 +        assert counts["instruction_following"] == 19
++
++
++# ---------------------------------------------------------------------------
++# Adaptive EMA-variance re-weighting
++# ---------------------------------------------------------------------------
++
++
++class TestAdaptiveMode:
++    """Adaptive re-weighting driven by update_rewards() feedback.
++
++    Contract: during warmup (configured via --env-sampling-warmup), the
++    sampler uses the user-provided initial weights unchanged. Once past
++    warmup AND at least refresh_interval rollouts since last refresh,
++    weights are re-derived from per-env reward EMAs:
++      variance[env] = ema[env] * (1 - ema[env])  (binary-reward proxy)
++      weight[env]   = variance / sum(variance), clamped to [floor, ceiling].
++    """
++
++    def _pool(self):
++        # Three roughly-equal buckets, enough for many draws.
++        return _make_pool({"math": 200, "code_gen": 200, "instruction_following": 200})
++
++    def _mk_sampler(self, **kw):
++        """Construct an adaptive sampler with sane test defaults."""
++        defaults = dict(
++            samples=self._pool(),
++            weights={"math": 1/3, "code_gen": 1/3, "instruction_following": 1/3},
++            seed=0,
++            adaptive=True,
++            ema_alpha=0.5,          # fast reaction in tests
++            refresh_interval=2,
++            weight_floor=0.05,
++            weight_ceiling=0.60,
++            warmup=3,
++        )
++        defaults.update(kw)
++        return EnvBalancedSampler(**defaults)
++
++    def test_warmup_period_uses_initial_weights(self):
++        """Before warmup expires, draws reflect the user-provided initial weights."""
++        sampler = self._mk_sampler(warmup=5, refresh_interval=1, weights={
++            "math": 0.5, "code_gen": 0.25, "instruction_following": 0.25,
++        })
++        # Feed updates that WOULD reshuffle weights if adaptive were active.
++        # Warmup=5, so the first 4 updates should leave weights untouched.
++        for _ in range(4):
++            sampler.update_rewards({
++                "math": 0.2, "code_gen": 0.5, "instruction_following": 0.95,
++            })
++        drawn = sampler.draw(100)
++        counts = _count_envs(drawn)
++        # Initial weights (0.5 / 0.25 / 0.25) still in effect.
++        assert counts["math"] == 50
++        assert counts["code_gen"] == 25
++        assert counts["instruction_following"] == 25
++
++    def test_after_warmup_variance_weighting_kicks_in(self):
++        """After warmup + refresh_interval, high-variance (middle-reward) envs
++        get up-sampled and saturated envs get down-sampled."""
++        sampler = self._mk_sampler(
++            warmup=2, refresh_interval=2, ema_alpha=0.0,  # ema=0 => reward==latest
++            weight_floor=0.01, weight_ceiling=0.95,
++        )
++        # Feed a clean signal 5 rollouts in a row: instruction_following is
++        # saturated (0.95 -> variance 0.0475), math and code_gen are in the
++        # learnable middle (0.5 -> max variance 0.25).
++        for _ in range(5):
++            sampler.update_rewards({
++                "math": 0.5,
++                "code_gen": 0.5,
++                "instruction_following": 0.95,
++            })
++        weights = sampler.weights
++        # math + code_gen should dominate; IF should be much smaller.
++        assert weights["math"] > weights["instruction_following"]
++        assert weights["code_gen"] > weights["instruction_following"]
++        # Sanity: the ratio roughly matches variances 0.25 / 0.0475 ≈ 5.26.
++        # With clamping off, math/IF ~ 0.42 / 0.08 = 5.25 — very close.
++        ratio = weights["math"] / weights["instruction_following"]
++        assert 3.0 < ratio < 10.0
++
++    def test_ema_smooths_single_bad_batch(self):
++        """Single-rollout outlier should barely move weights when alpha is high."""
++        sampler = self._mk_sampler(
++            warmup=0, refresh_interval=1, ema_alpha=0.95,  # very smooth
++            weight_floor=0.01, weight_ceiling=0.95,
++        )
++        # 10 batches where math and code_gen both sit at 0.5.
++        for _ in range(10):
++            sampler.update_rewards({"math": 0.5, "code_gen": 0.5, "instruction_following": 0.5})
++        weights_before = dict(sampler.weights)
++        # One huge outlier: math crashes to 0, IF to 1.0.
++        sampler.update_rewards({"math": 0.0, "code_gen": 0.5, "instruction_following": 1.0})
++        weights_after = dict(sampler.weights)
++        # EMA at alpha=0.95 absorbs mostly the prior; movement should be small.
++        for env in weights_before:
++            delta = abs(weights_after[env] - weights_before[env])
++            assert delta < 0.05, f"{env} moved by {delta} on single outlier, too reactive"
++
++    def test_weight_floor_prevents_starvation(self):
++        """An env whose variance goes to 0 (pass rate 1.0) still gets >= floor."""
++        sampler = self._mk_sampler(
++            warmup=0, refresh_interval=1, ema_alpha=0.0,
++            weight_floor=0.10, weight_ceiling=0.80,
++        )
++        # IF fully saturated (variance 0), others in the middle.
++        for _ in range(5):
++            sampler.update_rewards({
++                "math": 0.5, "code_gen": 0.5, "instruction_following": 1.0,
++            })
++        assert sampler.weights["instruction_following"] >= 0.10 - 1e-9
++        # Sanity: weights sum to 1.
++        assert abs(sum(sampler.weights.values()) - 1.0) < 1e-6
++
++    def test_weight_ceiling_prevents_monopoly(self):
++        """A unique max-variance env can't monopolize the batch past the ceiling."""
++        sampler = self._mk_sampler(
++            warmup=0, refresh_interval=1, ema_alpha=0.0,
++            weight_floor=0.01, weight_ceiling=0.40,
++        )
++        # math alone at max variance (0.5 -> 0.25); others saturated.
++        for _ in range(5):
++            sampler.update_rewards({
++                "math": 0.5, "code_gen": 0.99, "instruction_following": 0.99,
++            })
++        assert sampler.weights["math"] <= 0.40 + 1e-9
++        assert abs(sum(sampler.weights.values()) - 1.0) < 1e-6
++
++    def test_refresh_interval_honored(self):
++        """Weights stay untouched until refresh_interval updates have accumulated past warmup."""
++        sampler = self._mk_sampler(
++            warmup=0, refresh_interval=10, ema_alpha=0.0,
++            weight_floor=0.01, weight_ceiling=0.95,
++        )
++        initial = dict(sampler.weights)
++        # Feed 5 updates — well inside refresh_interval=10, so weights must not change.
++        for _ in range(5):
++            sampler.update_rewards({
++                "math": 0.5, "code_gen": 0.5, "instruction_following": 0.99,
++            })
++        assert sampler.weights == initial
++        # Feed 5 more (now at 10 updates) — refresh fires.
++        for _ in range(5):
++            sampler.update_rewards({
++                "math": 0.5, "code_gen": 0.5, "instruction_following": 0.99,
++            })
++        assert sampler.weights != initial
++
++    def test_state_dict_includes_ema_and_rollout_count(self):
++        """Save/load preserves adaptive EMA + rollout counter + live weights."""
++        s1 = self._mk_sampler(warmup=0, refresh_interval=1, ema_alpha=0.0)
++        for _ in range(4):
++            s1.update_rewards({
++                "math": 0.5, "code_gen": 0.5, "instruction_following": 0.9,
++            })
++        state = s1.state_dict()
++        assert "ema" in state
++        assert "rollout_counter" in state
++        assert state["rollout_counter"] == 4
++        assert state["ema"]["math"] == pytest.approx(0.5)
++        assert state["ema"]["instruction_following"] == pytest.approx(0.9)
++
++        s2 = EnvBalancedSampler(
++            samples=self._pool(),
++            weights={"math": 1/3, "code_gen": 1/3, "instruction_following": 1/3},
++            seed=0,
++            adaptive=True,
++            ema_alpha=0.0,
++            refresh_interval=1,
++            weight_floor=0.05,
++            weight_ceiling=0.60,
++            warmup=0,
++        )
++        s2.load_state_dict(state)
++        assert s2._rollout_counter == 4
++        assert s2._ema["math"] == pytest.approx(0.5)
++        assert s2._ema["instruction_following"] == pytest.approx(0.9)
++        assert s2.weights == s1.weights
++
++    def test_static_mode_unchanged(self):
++        """adaptive=False: update_rewards is a no-op and weights never change."""
++        pool = _make_pool({"math": 100, "code_gen": 100})
++        sampler = EnvBalancedSampler(pool, {"math": 0.5, "code_gen": 0.5}, seed=0)
++        # Confirm adaptive defaults to off, update_rewards is a no-op.
++        assert sampler.adaptive is False
++        initial = dict(sampler.weights)
++        for _ in range(20):
++            sampler.update_rewards({"math": 0.01, "code_gen": 0.99})
++        assert sampler.weights == initial
++        # And drawing still yields the static 50/50 split.
++        drawn = sampler.draw(100)
++        counts = _count_envs(drawn)
++        assert counts["math"] == 50
++        assert counts["code_gen"] == 50
++
++    def test_update_rewards_thread_safe(self):
++        """Concurrent update + draw calls don't crash or corrupt weights."""
++        sampler = self._mk_sampler(warmup=0, refresh_interval=2, ema_alpha=0.3)
++        errors: List[BaseException] = []
++        stop = threading.Event()
++
++        def updater():
++            try:
++                for i in range(200):
++                    if stop.is_set():
++                        return
++                    sampler.update_rewards({
++                        "math": (i % 10) / 10.0,
++                        "code_gen": 0.5,
++                        "instruction_following": 0.9,
++                    }, rollout_id=i)
++            except BaseException as e:  # pragma: no cover (failure path)
++                errors.append(e)
++
++        def drawer():
++            try:
++                for _ in range(200):
++                    if stop.is_set():
++                        return
++                    out = sampler.draw(30)
++                    # Weights always sum to 1 and are non-negative.
++                    total = sum(sampler.weights.values())
++                    assert abs(total - 1.0) < 1e-4, f"weights un-normalized: total={total}"
++                    assert all(w >= 0 for w in sampler.weights.values())
++                    assert len(out) == 30
++            except BaseException as e:  # pragma: no cover (failure path)
++                errors.append(e)
++
++        threads = [threading.Thread(target=updater), threading.Thread(target=drawer),
++                   threading.Thread(target=updater), threading.Thread(target=drawer)]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join(timeout=5.0)
++        stop.set()
++        assert not errors, f"concurrent execution raised: {errors}"
++
++    def test_unknown_env_in_rewards_dict_ignored(self, caplog):
++        """update_rewards({new_env: ...}) warns and skips; known envs still updated."""
++        sampler = self._mk_sampler(warmup=0, refresh_interval=1, ema_alpha=0.0)
++        with caplog.at_level(logging.WARNING):
++            sampler.update_rewards({
++                "math": 0.5,
++                "some_new_env_we_never_heard_of": 0.7,
++            })
++        # EMA updated for math, not for the unknown one.
++        assert sampler._ema["math"] == pytest.approx(0.5)
++        assert "some_new_env_we_never_heard_of" not in sampler._ema
++        assert any("unknown env" in r.message for r in caplog.records)
++
++    def test_active_sampler_registry(self):
++        """Module-level get_active_sampler() returns the last-constructed sampler."""
++        _clear_active_sampler()
++        assert get_active_sampler() is None
++        pool = _make_pool({"math": 10, "code_gen": 10})
++        sampler = EnvBalancedSampler(pool, {"math": 0.5, "code_gen": 0.5}, seed=0)
++        assert get_active_sampler() is sampler
++        _clear_active_sampler()
++
++
++# ---------------------------------------------------------------------------
++# WandB metrics: per-env draw counts, ratios, EMAs, and weight evolution.
++# ---------------------------------------------------------------------------
++
++
++class TestMetrics:
++    """The get_metrics() method is the WandB hook point. Contract:
++
++    * keys are prefixed with ``env_sampler/`` and are flat strings
++    * every value is a Python ``float`` (wandb rejects int/bool/str)
++    * every configured env appears in weight/, initial_weight/,
++      draw_ratio/, draw_count/, cumulative_ratio/
++    * adaptive-only keys (ema_reward/, variance/) are emitted as 0.0
++      in static mode so the dashboard doesn't go dark if someone
++      flips modes mid-run
++    """
++
++    def _pool(self):
++        return _make_pool({"math": 50, "code_gen": 50, "instruction_following": 50})
++
++    def _mk_static(self, **kw):
++        defaults = dict(
++            samples=self._pool(),
++            weights={"math": 0.5, "code_gen": 0.3, "instruction_following": 0.2},
++            seed=0,
++        )
++        defaults.update(kw)
++        return EnvBalancedSampler(**defaults)
++
++    def _mk_adaptive(self, **kw):
++        defaults = dict(
++            samples=self._pool(),
++            weights={"math": 1/3, "code_gen": 1/3, "instruction_following": 1/3},
++            seed=0,
++            adaptive=True,
++            ema_alpha=0.0,          # reward == latest
++            refresh_interval=1,
++            weight_floor=0.05,
++            weight_ceiling=0.80,
++            warmup=0,
++        )
++        defaults.update(kw)
++        return EnvBalancedSampler(**defaults)
++
++    def test_get_metrics_returns_all_envs(self):
++        """Every configured env must have weight/, initial_weight/,
++        draw_ratio/, draw_count/, cumulative_ratio/ entries."""
++        sampler = self._mk_static()
++        _ = sampler.draw(30)
++        m = sampler.get_metrics()
++        for env in ("math", "code_gen", "instruction_following"):
++            assert f"env_sampler/weight/{env}" in m
++            assert f"env_sampler/initial_weight/{env}" in m
++            assert f"env_sampler/draw_ratio/{env}" in m
++            assert f"env_sampler/draw_count/{env}" in m
++            assert f"env_sampler/cumulative_ratio/{env}" in m
++
++    def test_draw_ratios_sum_to_one(self):
++        sampler = self._mk_static()
++        _ = sampler.draw(30)
++        m = sampler.get_metrics()
++        total = sum(v for k, v in m.items() if k.startswith("env_sampler/draw_ratio/"))
++        assert abs(total - 1.0) < 1e-9
++
++    def test_weights_sum_to_one(self):
++        sampler = self._mk_static()
++        m = sampler.get_metrics()
++        total = sum(v for k, v in m.items() if k.startswith("env_sampler/weight/"))
++        assert abs(total - 1.0) < 1e-9
++
++    def test_initial_weights_never_change(self):
++        """After adaptive refreshes drive self.weights to a new distribution,
++        initial_weight/ keys still match the user's original input."""
++        sampler = self._mk_adaptive(
++            weights={"math": 0.1, "code_gen": 0.1, "instruction_following": 0.8},
++        )
++        # Drive adaptive to push things around.
++        for _ in range(20):
++            sampler.update_rewards({
++                "math": 0.5, "code_gen": 0.5, "instruction_following": 0.99,
++            })
++        # After refresh, IF should be much lower than 0.8.
++        assert sampler.weights["instruction_following"] < 0.5
++        m = sampler.get_metrics()
++        # ... but initial_weights are untouched. User-supplied weights are
++        # normalized at construction (0.1 + 0.1 + 0.8 = 1.0 already, so they
++        # pass through unchanged).
++        assert m["env_sampler/initial_weight/math"] == pytest.approx(0.1)
++        assert m["env_sampler/initial_weight/code_gen"] == pytest.approx(0.1)
++        assert m["env_sampler/initial_weight/instruction_following"] == pytest.approx(0.8)
++
++    def test_draw_count_matches_batch_size(self):
++        sampler = self._mk_static()
++        _ = sampler.draw(47)
++        m = sampler.get_metrics()
++        total = sum(v for k, v in m.items() if k.startswith("env_sampler/draw_count/"))
++        assert int(total) == 47
++        assert m["env_sampler/batch_size"] == 47.0
++
++    def test_cumulative_counts_track_across_batches(self):
++        """Over N batches of M samples, cumulative_ratio matches the average
++        draw ratio (which, in static mode, equals the configured weights)."""
++        sampler = self._mk_static(weights={"math": 0.5, "code_gen": 0.5})
++        pool2 = _make_pool({"math": 100, "code_gen": 100})
++        sampler = EnvBalancedSampler(pool2, {"math": 0.5, "code_gen": 0.5}, seed=0)
++        for _ in range(10):
++            sampler.draw(20)
++        m = sampler.get_metrics()
++        assert m["env_sampler/total_draws"] == 10.0
++        # 10 batches of 20 at 50/50 = 100 each. Cumulative ratio = 0.5.
++        assert m["env_sampler/cumulative_ratio/math"] == pytest.approx(0.5)
++        assert m["env_sampler/cumulative_ratio/code_gen"] == pytest.approx(0.5)
++
++    def test_ema_metrics_present_only_in_adaptive(self):
++        """In static mode: ema_reward/variance are 0.0, refreshes is 0, adaptive is 0.0.
++        In adaptive mode: they reflect the signal being fed in."""
++        # Static.
++        static = self._mk_static()
++        m = static.get_metrics()
++        assert m["env_sampler/adaptive"] == 0.0
++        assert m["env_sampler/refreshes"] == 0.0
++        for env in ("math", "code_gen", "instruction_following"):
++            assert m[f"env_sampler/ema_reward/{env}"] == 0.0
++            assert m[f"env_sampler/variance/{env}"] == 0.0
++
++        # Adaptive.
++        ad = self._mk_adaptive()
++        ad.update_rewards({"math": 0.5, "code_gen": 0.5, "instruction_following": 0.99})
++        ad.update_rewards({"math": 0.5, "code_gen": 0.5, "instruction_following": 0.99})
++        m = ad.get_metrics()
++        assert m["env_sampler/adaptive"] == 1.0
++        assert m["env_sampler/rollout_counter"] == 2.0
++        # refresh_interval=1, warmup=0 → refreshes incremented on every update.
++        assert m["env_sampler/refreshes"] >= 1.0
++        assert m["env_sampler/ema_reward/math"] == pytest.approx(0.5)
++        # variance = 0.5 * 0.5 = 0.25
++        assert m["env_sampler/variance/math"] == pytest.approx(0.25)
++        # variance at 0.99 ≈ 0.0099
++        assert m["env_sampler/variance/instruction_following"] == pytest.approx(0.99 * 0.01)
++
++    def test_metrics_returns_floats(self):
++        """wandb rejects ints/bools/strings for scalar metrics — every value
++        must be a Python ``float``."""
++        sampler = self._mk_adaptive()
++        sampler.update_rewards({"math": 0.4, "code_gen": 0.5, "instruction_following": 0.8})
++        _ = sampler.draw(30)
++        m = sampler.get_metrics()
++        # Deliberately avoid bool matching int: isinstance(True, int) is True,
++        # but not the other way around. We need plain float.
++        for k, v in m.items():
++            assert isinstance(v, float), f"{k}: expected float, got {type(v).__name__}={v!r}"
++            assert not isinstance(v, bool)  # redundant: bool is not float
++
++    def test_metrics_no_draw_yet(self):
++        """Before any draw(), draw-ratio/draw-count keys are still present
++        but zero — the dashboard doesn't have to special-case step 0."""
++        sampler = self._mk_static()
++        m = sampler.get_metrics()
++        for env in ("math", "code_gen", "instruction_following"):
++            assert m[f"env_sampler/draw_count/{env}"] == 0.0
++            assert m[f"env_sampler/draw_ratio/{env}"] == 0.0
++            assert m[f"env_sampler/cumulative_ratio/{env}"] == 0.0
++        assert m["env_sampler/total_draws"] == 0.0
++        assert m["env_sampler/batch_size"] == 0.0
++
++    def test_metrics_thread_safe(self):
++        """Concurrent draw() + update_rewards() + get_metrics() — no
++        exceptions, counts stay coherent."""
++        sampler = self._mk_adaptive(refresh_interval=2)
++        errors: List[BaseException] = []
++        stop = threading.Event()
++
++        def drawer():
++            try:
++                for _ in range(100):
++                    if stop.is_set():
++                        return
++                    sampler.draw(10)
++            except BaseException as e:  # pragma: no cover
++                errors.append(e)
++
++        def updater():
++            try:
++                for i in range(100):
++                    if stop.is_set():
++                        return
++                    sampler.update_rewards({
++                        "math": (i % 10) / 10.0,
++                        "code_gen": 0.5,
++                        "instruction_following": 0.9,
++                    }, rollout_id=i)
++            except BaseException as e:  # pragma: no cover
++                errors.append(e)
++
++        def metrics_reader():
++            try:
++                for _ in range(100):
++                    if stop.is_set():
++                        return
++                    m = sampler.get_metrics()
++                    # Keys are stable — all weights sum to 1 even mid-race.
++                    wsum = sum(v for k, v in m.items() if k.startswith("env_sampler/weight/"))
++                    assert abs(wsum - 1.0) < 1e-4, f"weight sum={wsum}"
++            except BaseException as e:  # pragma: no cover
++                errors.append(e)
++
++        threads = [
++            threading.Thread(target=drawer),
++            threading.Thread(target=updater),
++            threading.Thread(target=metrics_reader),
++            threading.Thread(target=metrics_reader),
++        ]
++        for t in threads:
++            t.start()
++        for t in threads:
++            t.join(timeout=5.0)
++        stop.set()
++        assert not errors, f"concurrent execution raised: {errors}"
