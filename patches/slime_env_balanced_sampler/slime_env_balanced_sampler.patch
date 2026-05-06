@@ -1,0 +1,614 @@
+# Slime env-balanced rollout sampler patch
+# Generated: 2026-05-06
+# Purpose: balance per-env fractions in each rollout batch when --env-sampling-weights set
+#
+# Why: RLVR1_v2 dataset is IF-heavy. Bottom-reward envs (math, code_gen) get
+# proportionally less gradient signal per step because their samples are
+# under-represented. This patch adds --env-sampling-weights to force
+# per-env fractions in every rollout batch.
+#
+# Files changed:
+#   NEW   slime/utils/env_balanced_sampling.py    stdlib-only helper (~190 lines)
+#   EDIT  slime/rollout/data_source.py            wires the sampler into RolloutDataSource
+#   EDIT  slime/utils/arguments.py                adds --env-sampling-weights + --env-sampling-metadata-key
+#   NEW   tests/test_env_balanced_sampling.py     18 unit tests
+#
+# Apply:
+#     cd /root/slime    # or wherever slime is
+#     git apply --check /tmp/slime_env_balanced_sampler.patch
+#     git apply        /tmp/slime_env_balanced_sampler.patch
+# Roll back:
+#     git apply --reverse /tmp/slime_env_balanced_sampler.patch
+#
+diff --git a/slime/rollout/data_source.py b/slime/rollout/data_source.py
+index e52cd27e..a79478bf 100644
+--- a/slime/rollout/data_source.py
++++ b/slime/rollout/data_source.py
+@@ -84,13 +84,37 @@ class RolloutDataSource(DataSource):
+             )
+             if self.args.rollout_shuffle:
+                 self.dataset.shuffle(self.epoch_id)
++
++            # Env-balanced sampling: when --env-sampling-weights is set, draw
++            # each rollout batch with configured per-env fractions rather than
++            # from a single sequential offset. See slime/utils/env_balanced_sampling.py
++            # for the contract.
++            self._env_sampler = None
++            if getattr(self.args, "env_sampling_weights", None):
++                from slime.utils.env_balanced_sampling import EnvBalancedSampler
++                self._env_sampler = EnvBalancedSampler(
++                    samples=self.dataset.samples,
++                    weights=self.args.env_sampling_weights,
++                    seed=self.args.rollout_seed,
++                    metadata_key=getattr(self.args, "env_sampling_metadata_key", "env_type"),
++                )
+         else:
+             self.dataset = None
++            self._env_sampler = None
+ 
+     def get_samples(self, num_samples):
+         # TODO further improve code
+         if self.dataset is not None:
+-            if self.sample_offset + num_samples <= len(self.dataset):
++            if self._env_sampler is not None:
++                # Env-balanced path: draw proportionally from per-env buckets.
++                # We still advance sample_offset/epoch_id for logging + metadata,
++                # but the balanced sampler owns the real per-env cursor state.
++                prompt_samples = self._env_sampler.draw(num_samples)
++                self.sample_offset += num_samples
++                if self.sample_offset >= len(self.dataset):
++                    self.epoch_id += 1
++                    self.sample_offset = self.sample_offset % max(len(self.dataset), 1)
++            elif self.sample_offset + num_samples <= len(self.dataset):
+                 prompt_samples = self.dataset.samples[self.sample_offset : self.sample_offset + num_samples]
+                 self.sample_offset += num_samples
+             else:
+diff --git a/slime/utils/arguments.py b/slime/utils/arguments.py
+index 8932dbd5..5f874f17 100644
+--- a/slime/utils/arguments.py
++++ b/slime/utils/arguments.py
+@@ -339,6 +339,30 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
+                     "This is used to shuffle the prompts and also for the random sampling of the prompts."
+                 ),
+             )
++            parser.add_argument(
++                "--env-sampling-weights",
++                type=json.loads,
++                default=None,
++                help=(
++                    "JSON dict mapping env_type -> fraction (weights are renormalized "
++                    "to sum to 1.0). When set, each rollout batch is drawn from per-env "
++                    "buckets in the configured proportions instead of a uniform sequential "
++                    "slice. Example: "
++                    "--env-sampling-weights '{\"math\": 0.25, \"code_gen\": 0.25, "
++                    "\"reasoning_gym\": 0.15, \"mcqa\": 0.10, \"structured_outputs\": 0.10, "
++                    "\"instruction_following\": 0.10, \"calendar\": 0.05}'. "
++                    "See slime/utils/env_balanced_sampling.py."
++                ),
++            )
++            parser.add_argument(
++                "--env-sampling-metadata-key",
++                type=str,
++                default="env_type",
++                help=(
++                    "The key inside sample.metadata that holds the env name for "
++                    "env-balanced sampling. Default: env_type."
++                ),
++            )
+ 
+             # sampling
+             parser.add_argument(
+diff --git a/slime/utils/env_balanced_sampling.py b/slime/utils/env_balanced_sampling.py
+new file mode 100644
+index 00000000..09911b6f
+--- /dev/null
++++ b/slime/utils/env_balanced_sampling.py
+@@ -0,0 +1,204 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Env-balanced prompt sampling for mixed-environment RLVR runs.
++
++The default ``RolloutDataSource.get_samples(N)`` draws a contiguous slice
++from a single shuffled list of prompts. When the dataset is heavily
++unbalanced (e.g. the RLVR1_v2 mix has instruction_following >> code_gen),
++each rollout batch is dominated by the majority env — and since GRPO/GSPO
++advantages are low-magnitude when the within-group reward is near 0 or 1,
++the bottom-reward environments (math, code_gen) receive proportionally
++less gradient signal per training step.
++
++This module provides an ``EnvBalancedSampler`` that, given a per-env
++target fraction, draws each rollout batch with the configured mix. Each
++env has its own shuffle order and offset pointer, so heavy envs are
++down-weighted and light envs are up-weighted (with bucket cycling when
++the bucket is exhausted). The result is that every rollout batch
++contains approximately the target fractions of each env, regardless of
++how the dataset as a whole is distributed.
++
++Contract:
++
++  * ``EnvBalancedSampler(samples, weights, seed, metadata_key)`` —
++    construct from a list of Sample objects, a ``{env: fraction}`` dict
++    (fractions should roughly sum to 1.0; the sampler normalizes), an
++    RNG seed, and the key under ``sample.metadata`` that holds the env
++    name.
++  * ``.draw(num_samples)`` — return ``num_samples`` prompts, with per-env
++    counts determined by the largest-remainder method for exactness.
++  * Samples whose metadata does not match any configured env are placed
++    in an "other" bucket; if the weights dict contains an entry for
++    ``"other"`` or ``"__other__"`` they are included at that weight,
++    otherwise they are dropped.
++
++Pure stdlib. No slime or torch imports. Unit-testable in isolation.
++"""
++
++from __future__ import annotations
++
++import logging
++import random
++from typing import Any, Dict, List, Optional
++
++logger = logging.getLogger(__name__)
++
++_OTHER_ENV = "__other__"
++
++
++class EnvBalancedSampler:
++    def __init__(
++        self,
++        samples: List[Any],
++        weights: Dict[str, float],
++        seed: int = 42,
++        metadata_key: str = "env_type",
++    ):
++        if not weights:
++            raise ValueError("env-balanced sampler requires a non-empty weights dict")
++
++        # Normalize weights so they sum to 1.0. Allow raw values like {math: 1,
++        # code_gen: 1, ...} for convenience.
++        total = float(sum(weights.values()))
++        if total <= 0:
++            raise ValueError(f"env-balanced weights must sum to a positive number, got {total}")
++        self.weights: Dict[str, float] = {env: w / total for env, w in weights.items()}
++
++        self._metadata_key = metadata_key
++        self._rng = random.Random(seed)
++
++        # Bucket samples by env_type. Samples whose metadata key is missing or
++        # unrecognized go into __other__; they are included in draws only if
++        # the weights dict has an entry for __other__.
++        self.buckets: Dict[str, List[Any]] = {env: [] for env in self.weights}
++        self._other_bucket: List[Any] = []
++        for s in samples:
++            md = getattr(s, "metadata", None)
++            env = None
++            if isinstance(md, dict):
++                env = md.get(metadata_key)
++            if env in self.buckets:
++                self.buckets[env].append(s)
++            else:
++                self._other_bucket.append(s)
++
++        if _OTHER_ENV in self.weights:
++            self.buckets[_OTHER_ENV] = self._other_bucket
++
++        for env, bucket in self.buckets.items():
++            logger.info(
++                "env_balanced_sampler: env=%s bucket_size=%d target_fraction=%.3f",
++                env, len(bucket), self.weights[env],
++            )
++        if self._other_bucket and _OTHER_ENV not in self.weights:
++            envs_seen = sorted({
++                (s.metadata or {}).get(metadata_key, "<missing>")
++                for s in self._other_bucket
++                if isinstance(getattr(s, "metadata", None), dict)
++            })
++            logger.warning(
++                "env_balanced_sampler: %d samples with unrecognized env_type "
++                "(seen: %s) — DROPPED from rollouts. Add \"__other__\": <weight> "
++                "to --env-sampling-weights to include them.",
++                len(self._other_bucket), envs_seen[:10],
++            )
++
++        # Fail fast if any configured env has an empty bucket.
++        empty = [env for env, b in self.buckets.items() if not b and self.weights.get(env, 0) > 0]
++        if empty:
++            raise ValueError(
++                f"env-balanced sampler: weights reference envs with zero matching "
++                f"samples in the dataset: {empty}. Check --env-sampling-weights vs "
++                f"the prompt_data metadata."
++            )
++
++        # Per-env shuffle order + offset. Each bucket is independently
++        # cycled; when its offset reaches the end, we reshuffle it.
++        self._order: Dict[str, List[int]] = {}
++        self._offset: Dict[str, int] = {}
++        for env in self.buckets:
++            self._reshuffle(env)
++
++    def _reshuffle(self, env: str) -> None:
++        order = list(range(len(self.buckets[env])))
++        self._rng.shuffle(order)
++        self._order[env] = order
++        self._offset[env] = 0
++
++    def _draw_env(self, env: str, n: int) -> List[Any]:
++        """Draw n samples from env's bucket with cycling + reshuffle."""
++        if n <= 0:
++            return []
++        out: List[Any] = []
++        bucket = self.buckets[env]
++        while len(out) < n:
++            order = self._order[env]
++            off = self._offset[env]
++            take = min(n - len(out), len(order) - off)
++            for i in range(take):
++                out.append(bucket[order[off + i]])
++            self._offset[env] = off + take
++            if self._offset[env] >= len(order):
++                self._reshuffle(env)
++        return out
++
++    def _compute_targets(self, n: int) -> Dict[str, int]:
++        """Distribute n into per-env integer counts summing exactly to n,
++        using the largest-remainder method. Envs in weights order act as
++        tie-breakers so behavior is deterministic."""
++        raw = {env: n * w for env, w in self.weights.items()}
++        floors = {env: int(v) for env, v in raw.items()}
++        leftover = n - sum(floors.values())
++        # Sort by (fractional part desc, env name) for determinism.
++        fracs = sorted(
++            ((env, raw[env] - floors[env]) for env in raw),
++            key=lambda kv: (-kv[1], kv[0]),
++        )
++        for i in range(leftover):
++            env = fracs[i % len(fracs)][0]
++            floors[env] += 1
++        return floors
++
++    def draw(self, num_samples: int, *, shuffle_output: bool = True) -> List[Any]:
++        """Return ``num_samples`` Sample objects with per-env counts
++        matching the configured weights."""
++        if num_samples <= 0:
++            return []
++        targets = self._compute_targets(num_samples)
++        drawn: List[Any] = []
++        for env, count in targets.items():
++            drawn.extend(self._draw_env(env, count))
++        # By default interleave so a downstream loop over ``drawn`` doesn't
++        # process all of env A before env B — matters if per-env state leaks
++        # across samples in the rollout engine.
++        if shuffle_output:
++            self._rng.shuffle(drawn)
++        return drawn
++
++    # ------------------------------------------------------------------
++    # State save/load — optional, for checkpoint resume.
++    # ------------------------------------------------------------------
++
++    def state_dict(self) -> Dict[str, Any]:
++        return {
++            "order": dict(self._order),
++            "offset": dict(self._offset),
++            "rng_state": self._rng.getstate(),
++            "weights": dict(self.weights),
++        }
++
++    def load_state_dict(self, state: Dict[str, Any]) -> None:
++        # Only load state that matches the current config; if bucket sizes
++        # differ (new dataset), ignore and start fresh.
++        for env in self.buckets:
++            if env in state.get("order", {}) and len(state["order"][env]) == len(self.buckets[env]):
++                self._order[env] = list(state["order"][env])
++                self._offset[env] = int(state["offset"].get(env, 0))
++            else:
++                self._reshuffle(env)
++        rng_state = state.get("rng_state")
++        if rng_state is not None:
++            try:
++                self._rng.setstate(rng_state)
++            except (TypeError, ValueError):
++                logger.warning("env_balanced_sampler: ignoring incompatible saved RNG state")
+diff --git a/tests/test_env_balanced_sampling.py b/tests/test_env_balanced_sampling.py
+new file mode 100644
+index 00000000..2cae3683
+--- /dev/null
++++ b/tests/test_env_balanced_sampling.py
+@@ -0,0 +1,298 @@
++# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Tests for slime/utils/env_balanced_sampling.py.
++
++The contract: given an unbalanced prompt pool and a per-env weights dict,
++every call to ``EnvBalancedSampler.draw(N)`` returns N prompts whose
++env_type distribution matches the weights (to within the exactness of
++largest-remainder rounding).
++
++Tested scenarios:
++  1. Default (no weights) — N/A, module isn't invoked
++  2. Perfectly matched weights + dataset — trivial case works
++  3. Unbalanced dataset (IF-heavy, like RLVR1_v2) + balanced weights —
++     rare envs are up-sampled with bucket cycling
++  4. Weights reference an env with zero samples — fails fast at init
++  5. Samples missing env_type — dropped unless __other__ in weights
++  6. Multiple draw calls + bucket cycling across dataset boundary
++  7. largest-remainder exactness: draw(N) returns EXACTLY N samples
++  8. state_dict round-trip: save/restore per-env cursor state
++"""
++
++from __future__ import annotations
++
++import collections
++import logging
++from types import SimpleNamespace
++from typing import Any, Dict, List
++
++import pytest
++
++from slime.utils.env_balanced_sampling import EnvBalancedSampler
++
++
++def _make_sample(env: str, idx: int = 0) -> SimpleNamespace:
++    return SimpleNamespace(metadata={"env_type": env}, _id=idx)
++
++
++def _make_pool(counts: Dict[str, int]) -> List[SimpleNamespace]:
++    out = []
++    for env, n in counts.items():
++        for i in range(n):
++            out.append(_make_sample(env, idx=i))
++    return out
++
++
++def _count_envs(samples: List[Any]) -> Dict[str, int]:
++    return dict(collections.Counter(s.metadata["env_type"] for s in samples))
++
++
++# ---------------------------------------------------------------------------
++# Basic correctness
++# ---------------------------------------------------------------------------
++
++
++class TestDrawBasicCorrectness:
++    def test_balanced_dataset_balanced_weights(self):
++        pool = _make_pool({"math": 50, "code_gen": 50})
++        sampler = EnvBalancedSampler(pool, {"math": 0.5, "code_gen": 0.5}, seed=0)
++        drawn = sampler.draw(100)
++        assert len(drawn) == 100
++        counts = _count_envs(drawn)
++        assert counts["math"] == 50
++        assert counts["code_gen"] == 50
++
++    def test_unbalanced_dataset_balanced_weights_upsamples_rare(self):
++        """IF-heavy dataset (mirrors RLVR1_v2) — balanced weights should
++        force each draw to contain equal per-env counts even though IF
++        dominates the dataset 2:1."""
++        pool = _make_pool({
++            "instruction_following": 100,
++            "math": 10,
++            "code_gen": 10,
++        })
++        sampler = EnvBalancedSampler(
++            pool,
++            {"instruction_following": 1/3, "math": 1/3, "code_gen": 1/3},
++            seed=0,
++        )
++        drawn = sampler.draw(90)
++        counts = _count_envs(drawn)
++        assert counts["instruction_following"] == 30
++        assert counts["math"] == 30
++        assert counts["code_gen"] == 30
++
++    def test_draw_returns_exactly_n_samples(self):
++        """Largest-remainder method must give exact counts even when
++        fractions don't divide evenly."""
++        pool = _make_pool({"a": 50, "b": 50, "c": 50})
++        # 7/3 = 2.33 each — remainders must be distributed.
++        sampler = EnvBalancedSampler(pool, {"a": 1, "b": 1, "c": 1}, seed=0)
++        drawn = sampler.draw(7)
++        assert len(drawn) == 7
++        # Expect [3,2,2] or permutation — floors 2,2,2 + 1 leftover.
++        counts = _count_envs(drawn)
++        assert sorted(counts.values()) == [2, 2, 3]
++
++    def test_weights_renormalize(self):
++        """User provides raw counts (not fractions) — should still work."""
++        pool = _make_pool({"a": 100, "b": 100})
++        sampler = EnvBalancedSampler(pool, {"a": 3, "b": 1}, seed=0)
++        drawn = sampler.draw(100)
++        counts = _count_envs(drawn)
++        assert counts["a"] == 75
++        assert counts["b"] == 25
++
++
++# ---------------------------------------------------------------------------
++# Error and edge cases
++# ---------------------------------------------------------------------------
++
++
++class TestErrors:
++    def test_empty_weights_rejected(self):
++        pool = _make_pool({"a": 10})
++        with pytest.raises(ValueError, match="non-empty"):
++            EnvBalancedSampler(pool, {}, seed=0)
++
++    def test_zero_total_weight_rejected(self):
++        pool = _make_pool({"a": 10})
++        with pytest.raises(ValueError, match="positive"):
++            EnvBalancedSampler(pool, {"a": 0, "b": 0}, seed=0)
++
++    def test_weight_references_missing_env(self):
++        """If weights mention an env but dataset has zero samples of it,
++        fail at init, don't silently return short batches."""
++        pool = _make_pool({"math": 10})
++        with pytest.raises(ValueError, match="zero matching"):
++            EnvBalancedSampler(pool, {"math": 0.5, "code_gen": 0.5}, seed=0)
++
++    def test_draw_zero_returns_empty(self):
++        pool = _make_pool({"a": 10})
++        sampler = EnvBalancedSampler(pool, {"a": 1.0}, seed=0)
++        assert sampler.draw(0) == []
++
++    def test_draw_negative_returns_empty(self):
++        pool = _make_pool({"a": 10})
++        sampler = EnvBalancedSampler(pool, {"a": 1.0}, seed=0)
++        assert sampler.draw(-5) == []
++
++
++# ---------------------------------------------------------------------------
++# Bucket cycling (target > bucket size)
++# ---------------------------------------------------------------------------
++
++
++class TestBucketCycling:
++    def test_target_exceeds_bucket_size_cycles_with_replacement(self):
++        """When weights demand more samples of env X than exist in its
++        bucket, the sampler cycles through the bucket (with a reshuffle
++        each full pass)."""
++        pool = _make_pool({"rare": 5, "common": 1000})
++        sampler = EnvBalancedSampler(pool, {"rare": 0.5, "common": 0.5}, seed=0)
++        drawn = sampler.draw(100)
++        counts = _count_envs(drawn)
++        assert counts["rare"] == 50  # drew 50 from a bucket of 5 → 10× cycled
++        assert counts["common"] == 50
++
++    def test_cycling_preserves_diversity_within_cycle(self):
++        """Within a single cycle (bucket_size consecutive draws), each
++        sample in the bucket is used exactly once."""
++        pool = _make_pool({"a": 5, "b": 5})
++        sampler = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=0)
++        # Draw exactly 5+5=10 samples — one full pass per bucket.
++        drawn = sampler.draw(10, shuffle_output=False)
++        a_samples = [s._id for s in drawn if s.metadata["env_type"] == "a"]
++        assert sorted(a_samples) == [0, 1, 2, 3, 4]  # each used once
++
++    def test_multiple_draws_accumulate_to_target(self):
++        """Over many small draws, the long-run distribution converges on
++        the target weights."""
++        pool = _make_pool({"a": 100, "b": 100})
++        sampler = EnvBalancedSampler(pool, {"a": 0.7, "b": 0.3}, seed=0)
++        total = collections.Counter()
++        for _ in range(100):
++            for s in sampler.draw(10):
++                total[s.metadata["env_type"]] += 1
++        # 1000 total; expect 700/300 exactly (LR method always hits targets).
++        assert total["a"] == 700
++        assert total["b"] == 300
++
++
++# ---------------------------------------------------------------------------
++# Other-env bucket handling
++# ---------------------------------------------------------------------------
++
++
++class TestOtherEnvBucket:
++    def test_unknown_env_dropped_by_default(self, caplog):
++        pool = _make_pool({"math": 10, "weird_unknown": 20})
++        with caplog.at_level(logging.WARNING):
++            sampler = EnvBalancedSampler(pool, {"math": 1.0}, seed=0)
++        drawn = sampler.draw(20)
++        # All math because weird_unknown was dropped.
++        assert all(s.metadata["env_type"] == "math" for s in drawn)
++        assert any("unrecognized env_type" in r.message for r in caplog.records)
++
++    def test_unknown_env_included_via_other_key(self):
++        pool = _make_pool({"math": 10, "weird_unknown": 10, "another_weird": 10})
++        sampler = EnvBalancedSampler(
++            pool,
++            {"math": 0.5, "__other__": 0.5},
++            seed=0,
++        )
++        drawn = sampler.draw(20)
++        counts = _count_envs(drawn)
++        assert counts["math"] == 10
++        # The 10 __other__ slots come from the weird_unknown + another_weird pool.
++        other = [s for s in drawn if s.metadata["env_type"] in {"weird_unknown", "another_weird"}]
++        assert len(other) == 10
++
++
++# ---------------------------------------------------------------------------
++# Reproducibility + state
++# ---------------------------------------------------------------------------
++
++
++class TestReproducibility:
++    def test_same_seed_same_output(self):
++        pool = _make_pool({"a": 30, "b": 30})
++        s1 = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=42)
++        s2 = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=42)
++        out1 = s1.draw(50)
++        out2 = s2.draw(50)
++        assert [s._id for s in out1] == [s._id for s in out2]
++        assert [s.metadata["env_type"] for s in out1] == [s.metadata["env_type"] for s in out2]
++
++    def test_different_seed_different_output(self):
++        pool = _make_pool({"a": 100, "b": 100})
++        s1 = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=1)
++        s2 = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=2)
++        out1 = s1.draw(50)
++        out2 = s2.draw(50)
++        # Same counts but different order / different specific samples.
++        assert [s._id for s in out1] != [s._id for s in out2]
++
++    def test_state_dict_roundtrip(self):
++        pool = _make_pool({"a": 20, "b": 20})
++        s1 = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=42)
++        _ = s1.draw(20)  # advance cursors
++        state = s1.state_dict()
++
++        # New sampler with same config + same seed — loaded state should
++        # resume from where s1 left off.
++        s2 = EnvBalancedSampler(pool, {"a": 0.5, "b": 0.5}, seed=42)
++        s2.load_state_dict(state)
++        assert s2._offset == s1._offset
++        assert s2._order == s1._order
++
++
++# ---------------------------------------------------------------------------
++# Integration-ish: simulates a 7-env RLVR1_v2-style dataset
++# ---------------------------------------------------------------------------
++
++
++class TestRLVRStyleScenario:
++    def test_rlvr1_v2_mix_balancing(self):
++        """Simulates the actual RLVR1_v2 dataset ratios (IF-dominated)
++        and confirms that the configured balance is enforced."""
++        # Approximate dataset distribution from analysis:
++        pool = _make_pool({
++            "instruction_following": 19000,
++            "code_gen": 11500,
++            "math": 10500,
++            "mcqa": 5500,
++            "structured_outputs": 4500,
++            "calendar": 4500,
++            "reasoning_gym": 3000,
++        })
++        target = {
++            "math": 0.25,
++            "code_gen": 0.25,
++            "reasoning_gym": 0.15,
++            "mcqa": 0.10,
++            "structured_outputs": 0.10,
++            "instruction_following": 0.10,
++            "calendar": 0.05,
++        }
++        sampler = EnvBalancedSampler(pool, target, seed=42)
++        # A rollout is 192 prompts in the real recipe.
++        drawn = sampler.draw(192)
++        counts = _count_envs(drawn)
++
++        # Expected counts (LR): math=48, code_gen=48, reasoning_gym=29,
++        # mcqa=19, structured_outputs=19, instruction_following=19, calendar=10.
++        assert sum(counts.values()) == 192
++        # Every env should appear at the target fraction (within 1 due to
++        # integer rounding).
++        for env, w in target.items():
++            expected = round(192 * w)
++            assert abs(counts[env] - expected) <= 1, (
++                f"{env}: got {counts[env]}, expected ~{expected}"
++            )
++        # The rare env (reasoning_gym) gets 29 slots per batch, 15% — up
++        # from its ~5% natural share in the dataset.
++        assert counts["reasoning_gym"] == 29
++        # The dominant env (instruction_following) gets 19 slots per batch —
++        # down from its ~33% natural share.
++        assert counts["instruction_following"] == 19
